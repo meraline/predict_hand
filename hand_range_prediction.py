@@ -3485,29 +3485,255 @@ def main():
 #     main()
 
 
+def choose_data_file_with_percentage():
+    """Выбор файла с данными с возможностью выбора процента файлов"""
+    data_files = find_data_files()
+
+    if not data_files:
+        print("❌ CSV файлы с данными не найдены!")
+        print("Поместите CSV файл в папку 'data' или в текущую директорию")
+        return None
+
+    if len(data_files) == 1:
+        print(f"✅ Найден файл данных: {data_files[0]}")
+        return data_files[0]
+
+    # Подсчитываем общий размер всех файлов
+    total_size_mb = 0
+    file_stats = []
+
+    for file in data_files:
+        size_mb = os.path.getsize(file) / 1024 / 1024
+        total_size_mb += size_mb
+        file_stats.append((file, size_mb))
+
+    # Сортируем по размеру
+    sorted_files = sorted(file_stats, key=lambda x: x[1], reverse=True)
+
+    print(
+        f"📁 Найдено {len(data_files)} файлов с данными (общий размер: {total_size_mb:.1f} MB):"
+    )
+
+    # Показываем топ-10 файлов
+    print(f"📊 Топ-10 крупнейших файлов:")
+    for i, (file, size_mb) in enumerate(sorted_files[:10]):
+        percentage = (size_mb / total_size_mb) * 100
+        print(
+            f"  {i+1}. {os.path.basename(file)} ({size_mb:.1f} MB, {percentage:.1f}%)"
+        )
+
+    if len(data_files) > 10:
+        print(f"\n📋 Показаны только топ-10 файлов из {len(data_files)}")
+
+    print(f"\n📊 ОПЦИИ ВЫБОРА:")
+    print(f"  0. ⭐ ОБЪЕДИНИТЬ ВСЕ {len(data_files)} ФАЙЛОВ (100%)")
+    print(f"  25. 📊 Объединить 25% файлов (~{len(data_files)//4} файлов)")
+    print(f"  50. 📊 Объединить 50% файлов (~{len(data_files)//2} файлов)")
+    print(f"  75. 📊 Объединить 75% файлов (~{3*len(data_files)//4} файлов)")
+    print(f"  1-10. 📄 Выбрать конкретный файл из топ-10")
+    print(f"  p. 🎯 Ввести свой процент (например: p30 для 30%)")
+
+    while True:
+        try:
+            choice = input("\nВыберите опцию: ").strip().lower()
+
+            if choice in ["q", "quit", "exit"]:
+                return None
+
+            # Проверяем процентный ввод
+            if choice.startswith("p"):
+                try:
+                    custom_percent = int(choice[1:])
+                    if 1 <= custom_percent <= 100:
+                        num_files = max(1, int(len(data_files) * custom_percent / 100))
+                        print(
+                            f"✅ Выбрано: объединить {custom_percent}% файлов ({num_files} из {len(data_files)})"
+                        )
+                        return ("COMBINE_PERCENT", custom_percent)
+                    else:
+                        print("❌ Процент должен быть от 1 до 100")
+                        continue
+                except ValueError:
+                    print("❌ Неверный формат. Используйте p25 для 25%")
+                    continue
+
+            # Обработка числовых вводов
+            choice_num = int(choice)
+
+            if choice_num == 0:
+                print(f"✅ Выбрано: объединить все {len(data_files)} файлов")
+                return ("COMBINE_PERCENT", 100)
+            elif choice_num == 25:
+                print(
+                    f"✅ Выбрано: объединить 25% файлов ({len(data_files)//4} из {len(data_files)})"
+                )
+                return ("COMBINE_PERCENT", 25)
+            elif choice_num == 50:
+                print(
+                    f"✅ Выбрано: объединить 50% файлов ({len(data_files)//2} из {len(data_files)})"
+                )
+                return ("COMBINE_PERCENT", 50)
+            elif choice_num == 75:
+                print(
+                    f"✅ Выбрано: объединить 75% файлов ({3*len(data_files)//4} из {len(data_files)})"
+                )
+                return ("COMBINE_PERCENT", 75)
+            elif 1 <= choice_num <= min(10, len(data_files)):
+                selected_file = sorted_files[choice_num - 1][0]
+                print(f"✅ Выбран файл: {selected_file}")
+                return selected_file
+            else:
+                print(f"❌ Неверный выбор")
+
+        except ValueError:
+            print("❌ Введите число или процент (p30)")
+
+
+def combine_percentage_of_files(percentage):
+    """Объединение указанного процента файлов"""
+    data_files = find_data_files()
+
+    if not data_files:
+        print("❌ Не найдено файлов для объединения")
+        return None
+
+    # Сортируем файлы по размеру (берем сначала большие)
+    file_stats = []
+    for file in data_files:
+        size = os.path.getsize(file)
+        file_stats.append((file, size))
+
+    # Сортируем по размеру в убывающем порядке
+    sorted_files = sorted(file_stats, key=lambda x: x[1], reverse=True)
+
+    # Выбираем нужное количество файлов
+    num_files_to_take = max(1, int(len(data_files) * percentage / 100))
+    selected_files = [f[0] for f in sorted_files[:num_files_to_take]]
+
+    print(f"\n🔗 === ОБЪЕДИНЕНИЕ {percentage}% ФАЙЛОВ ===")
+    print(f"📊 Выбрано {num_files_to_take} из {len(data_files)} файлов")
+    print(f"📈 Это самые большие файлы по размеру")
+
+    all_dataframes = []
+    total_records = 0
+    total_showdowns = 0
+    total_size_mb = 0
+
+    for i, data_path in enumerate(selected_files, 1):
+        print(
+            f"📄 Загружаем файл {i}/{num_files_to_take}: {os.path.basename(data_path)}"
+        )
+
+        try:
+            df = pd.read_csv(data_path)
+
+            # Добавляем информацию об источнике
+            df["source_file"] = os.path.basename(data_path)
+            df["file_index"] = i
+
+            # Подсчет статистики
+            showdowns_in_file = (
+                (df["Showdown_1"].notna()) & (df["Showdown_2"].notna())
+            ).sum()
+            file_size_mb = os.path.getsize(data_path) / 1024 / 1024
+
+            print(
+                f"   📊 Размер: {len(df):,} строк, {file_size_mb:.1f} MB, шоудаунов: {showdowns_in_file:,}"
+            )
+
+            all_dataframes.append(df)
+            total_records += len(df)
+            total_showdowns += showdowns_in_file
+            total_size_mb += file_size_mb
+
+        except Exception as e:
+            print(f"   ❌ Ошибка загрузки: {e}")
+            continue
+
+    if not all_dataframes:
+        print("❌ Не удалось загрузить ни одного файла")
+        return None
+
+    # Объединяем данные
+    print(f"\n🔄 Объединяем данные...")
+    combined_df = pd.concat(all_dataframes, ignore_index=True, sort=False)
+
+    print(f"✅ Объединение завершено:")
+    print(f"   📈 Общий размер: {total_records:,} строк")
+    print(f"   💾 Общий объем: {total_size_mb:.1f} MB")
+    print(f"   🃏 Общее количество шоудаунов: {total_showdowns:,}")
+    print(
+        f"   📊 Процент записей с шоудауном: {total_showdowns/total_records*100:.1f}%"
+    )
+    print(f"   📁 Использовано файлов: {num_files_to_take} ({percentage}%)")
+
+    # Сохраняем объединенный файл
+    combined_dir = os.path.join("data", "combined")
+    os.makedirs(combined_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    combined_filename = os.path.join(
+        combined_dir, f"combined_{percentage}pct_poker_data_{timestamp}.csv"
+    )
+
+    combined_df.to_csv(combined_filename, index=False)
+    print(f"💾 Объединенные данные сохранены: {combined_filename}")
+
+    # Создаем сводку
+    summary = {
+        "timestamp": datetime.now().isoformat(),
+        "percentage_selected": percentage,
+        "total_files_available": len(data_files),
+        "files_used": num_files_to_take,
+        "total_records": int(total_records),
+        "total_showdowns": int(total_showdowns),
+        "total_size_mb": float(total_size_mb),
+        "combined_file": combined_filename,
+        "files_included": [
+            os.path.basename(f) for f in selected_files[:10]
+        ],  # Первые 10 для примера
+    }
+
+    summary_path = f"results/data_combination_{percentage}pct_summary_{timestamp}.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    print(f"📋 Сводка сохранена: {summary_path}")
+
+    return combined_filename, summary
+
+
 def main_with_sequences():
-    """
-    Обновленная главная функция с поддержкой последовательностей и комбинированного разделения данных
-    """
+    """Обновленная главная функция с поддержкой выбора процента файлов"""
     print("🎰 === ОБУЧЕНИЕ RWKV МОДЕЛЕЙ С ПОСЛЕДОВАТЕЛЬНОСТЯМИ ===\n")
 
     # Создаем необходимые папки
     setup_directories()
     save_categories_json()
 
-    # Выбираем файл данных
-    data_choice = choose_data_file()
+    # Выбираем файл данных с новой функцией
+    data_choice = choose_data_file_with_percentage()
     if not data_choice:
         print("👋 Выход из программы.")
         return
 
-    # Проверяем массовую обработку
-    if data_choice == "COMBINE_ALL":
-        process_all_files_with_sequences()
-        return
+    # Обрабатываем выбор
+    if isinstance(data_choice, tuple) and data_choice[0] == "COMBINE_PERCENT":
+        percentage = data_choice[1]
 
-    # Обычная обработка одного файла
-    data_path = data_choice
+        # Объединяем указанный процент файлов
+        result = combine_percentage_of_files(percentage)
+        if result is None:
+            print("❌ Не удалось объединить файлы")
+            return
+
+        data_path, combination_summary = result
+        print(f"\n✅ Будем обучать модели на {percentage}% данных")
+
+    else:
+        # Обычная обработка одного файла
+        data_path = data_choice
+        combination_summary = None
 
     # Анализ файла данных
     print(f"\n📊 === АНАЛИЗ ДАННЫХ ===")
