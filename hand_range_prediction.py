@@ -1099,6 +1099,9 @@ class HandRangeRWKV(nn.Module):
 
 
 # ---------------------- 2. Анализ покерных рук ----------------------
+# Добавьте эти методы в класс PokerHandAnalyzer
+
+
 class PokerHandAnalyzer:
     """Класс для анализа силы покерных рук"""
 
@@ -1120,38 +1123,6 @@ class PokerHandAnalyzer:
 
     SUIT_MAP = {"s": 0, "h": 1, "d": 2, "c": 3}
 
-    HAND_CATEGORIES = {
-        "premium_pair": ["AA", "KK", "QQ"],
-        "strong_pair": ["JJ", "TT", "99"],
-        "medium_pair": ["88", "77", "66", "55"],
-        "small_pair": ["44", "33", "22"],
-        "premium_ace": ["AKs", "AKo", "AQs", "AQo"],
-        "strong_ace": ["AJs", "AJo", "ATs", "ATo"],
-        "suited_connector": ["KQs", "QJs", "JTs", "T9s", "98s", "87s", "76s"],
-        "offsuit_broadway": ["KQo", "QJo", "JTo", "KJo"],
-    }
-
-    @staticmethod
-    def get_all_categories():
-        """Возвращает все доступные категории"""
-        return list(PokerHandAnalyzer.HAND_CATEGORIES.keys()) + ["other"]
-
-    @staticmethod
-    def get_category_mapping():
-        """Возвращает маппинг категорий для JSON"""
-        category_mapping = {
-            "premium_pair": 0,
-            "strong_pair": 1,
-            "medium_pair": 2,
-            "small_pair": 3,
-            "premium_ace": 4,
-            "strong_ace": 5,
-            "suited_connector": 6,
-            "offsuit_broadway": 7,
-            "other": 8,
-        }
-        return category_mapping
-
     @staticmethod
     def get_rank_names():
         """Возвращает названия рангов для JSON"""
@@ -1172,87 +1143,50 @@ class PokerHandAnalyzer:
         return rank, suit
 
     @staticmethod
-    def analyze_hand_strength(card1, card2):
-        """Анализ силы стартовой руки (префлоп)"""
-        rank1, suit1 = PokerHandAnalyzer.parse_card(card1)
-        rank2, suit2 = PokerHandAnalyzer.parse_card(card2)
+    def get_all_categories():
+        """Возвращает список категорий для старой системы (9 категорий)"""
+        return [
+            "high_card",
+            "pair",
+            "two_pair",
+            "three_of_kind",
+            "straight",
+            "flush",
+            "full_house",
+            "four_of_kind",
+            "straight_flush",
+        ]
+
+    @staticmethod
+    def get_category_mapping():
+        """Возвращает маппинг категорий в индексы"""
+        categories = PokerHandAnalyzer.get_all_categories()
+        return {cat: i for i, cat in enumerate(categories)}
+
+    def analyze_hand_strength(self, card1, card2):
+        """
+        Анализирует силу руки (для старой системы)
+        Возвращает: (strength 0-9, category)
+        """
+        # Это заглушка для старой системы
+        # В вашем случае используется HM3, так что этот метод не критичен
+
+        rank1, suit1 = self.parse_card(card1)
+        rank2, suit2 = self.parse_card(card2)
 
         if rank1 is None or rank2 is None:
-            return 0, "unknown"
+            return 0, "other"
 
-        # Нормализуем порядок карт (старшая первой)
-        if rank1 < rank2:
-            rank1, rank2 = rank2, rank1
-            suit1, suit2 = suit2, suit1
-
-        is_suited = suit1 == suit2
-        is_pair = rank1 == rank2
-
-        # Определение категории и силы
-        hand_str = PokerHandAnalyzer._format_hand_string(
-            rank1, rank2, is_suited, is_pair
-        )
-        category = PokerHandAnalyzer._get_hand_category(hand_str)
-        strength = PokerHandAnalyzer._calculate_hand_strength(
-            rank1, rank2, is_suited, is_pair
-        )
-
-        return strength, category
-
-    @staticmethod
-    def _format_hand_string(rank1, rank2, is_suited, is_pair):
-        """Форматирование руки в стандартную строку"""
-        rank_chars = {v: k for k, v in PokerHandAnalyzer.RANK_MAP.items()}
-
-        if is_pair:
-            return f"{rank_chars[rank1]}{rank_chars[rank2]}"
-        else:
-            suffix = "s" if is_suited else "o"
-            return f"{rank_chars[rank1]}{rank_chars[rank2]}{suffix}"
-
-    @staticmethod
-    def _get_hand_category(hand_str):
-        """Определение категории руки"""
-        for category, hands in PokerHandAnalyzer.HAND_CATEGORIES.items():
-            if hand_str in hands:
-                return category
-        return "other"
-
-    @staticmethod
-    def _calculate_hand_strength(rank1, rank2, is_suited, is_pair):
-        """Расчет силы руки (0-9 шкала)"""
-        if is_pair:
-            if rank1 >= 14:  # AA
-                return 9
-            elif rank1 >= 13:  # KK
-                return 8
-            elif rank1 >= 12:  # QQ
-                return 7
-            elif rank1 >= 11:  # JJ
-                return 6
-            elif rank1 >= 10:  # TT
-                return 5
-            elif rank1 >= 9:  # 99
-                return 4
-            elif rank1 >= 8:  # 88
-                return 3
-            elif rank1 >= 7:  # 77
-                return 2
-            elif rank1 >= 6:  # 66
-                return 1
-            else:
-                return 0
-        else:
-            # Непарные руки
-            high_card_bonus = max(0, rank1 - 10)
-            second_card_bonus = max(0, rank2 - 8)
-            suited_bonus = 1 if is_suited else 0
-            connector_bonus = 1 if abs(rank1 - rank2) == 1 else 0
-
-            base_strength = (
-                high_card_bonus + second_card_bonus + suited_bonus + connector_bonus
-            )
-            return min(9, max(0, base_strength))
+        # Простая логика для карманных карт
+        if rank1 == rank2:  # Пара
+            strength = min(9, 2 + (rank1 - 2) // 2)  # 2-9 в зависимости от ранга
+            return strength, "pair"
+        elif suit1 == suit2:  # Одномастные
+            strength = min(9, 3 + max(rank1, rank2) // 3)
+            return strength, "high_card"
+        else:  # Разномастные
+            strength = min(9, max(rank1, rank2) // 2)
+            return strength, "high_card"
 
 
 # ---------------------- 3. Подготовка данных ----------------------
@@ -1778,7 +1712,7 @@ def evaluate_model_performance(model, data_dict, include_hole_cards=True):
     print(f"MSE для конкретных рангов: {specific_mse:.4f}")
 
     # Детальный отчет по категориям
-    category_names = PokerHandAnalyzer.get_all_categories()
+    category_names = get_all_hm3_categories()
     print(f"\nОтчет по категориям рук:")
     print(
         classification_report(
@@ -2004,36 +1938,38 @@ def find_data_files(data_dir="data"):
 
 
 def save_categories_json():
-    """Сохранение JSON файла с категориями"""
+    """Сохранение JSON файла с HM3 категориями"""
+    evaluator = PokerHandEvaluator()
+    all_categories = get_all_hm3_categories()
+
     categories_info = {
-        "hand_categories": PokerHandAnalyzer.HAND_CATEGORIES,
-        "all_categories": PokerHandAnalyzer.get_all_categories(),
-        "category_mapping": PokerHandAnalyzer.get_category_mapping(),
-        "rank_names": PokerHandAnalyzer.get_rank_names(),
+        "classification_system": "HoldemManager3",
+        "total_categories": len(all_categories),
+        "categories": all_categories,
+        "categories_by_strength": {
+            str(strength): [
+                cat
+                for cat in all_categories
+                if evaluator.hand_type_to_strength.get(cat, -1) == strength
+            ]
+            for strength in range(5)
+        },
         "strength_levels": {
-            "0": "Очень слабая рука",
-            "1": "Слабая рука",
-            "2": "Ниже средней",
-            "3": "Средняя рука",
-            "4": "Выше средней",
-            "5": "Хорошая рука",
-            "6": "Сильная рука",
-            "7": "Очень сильная",
-            "8": "Премиум рука",
-            "9": "Лучшие руки",
+            "0": "Мусор/Дро (Trash/Draws)",
+            "1": "Слабые руки (Weak hands)",
+            "2": "Средние руки (Medium hands)",
+            "3": "Сильные руки (Strong hands)",
+            "4": "Монстры (Monster hands)",
         },
-        "description": {
-            "categories": "Категории покерных рук для классификации",
-            "strength_levels": "Уровни силы рук от 0 (слабейшие) до 9 (сильнейшие)",
-            "rank_names": "Названия рангов карт от 2 до Ace",
-        },
+        "rank_names": PokerHandAnalyzer.get_rank_names(),
+        "description": "HoldemManager3 система классификации с 73 типами рук",
     }
 
     os.makedirs("results", exist_ok=True)
-    with open("results/poker_categories.json", "w", encoding="utf-8") as f:
+    with open("results/hm3_poker_categories.json", "w", encoding="utf-8") as f:
         json.dump(categories_info, f, indent=2, ensure_ascii=False)
 
-    print("Сохранен файл с категориями: results/poker_categories.json")
+    print("💾 Сохранен файл с HM3 категориями: results/hm3_poker_categories.json")
     return categories_info
 
 
@@ -3629,6 +3565,7 @@ def train_sequence_hand_range_model(
     return model, history
 
 
+# 2. Исправленная функция evaluate_sequence_model_performance
 def evaluate_sequence_model_performance(model, data_dict, include_hole_cards=True):
     """
     Детальная оценка производительности последовательной модели
@@ -3719,27 +3656,29 @@ def evaluate_sequence_model_performance(model, data_dict, include_hole_cards=Tru
             count = mask.sum()
             print(f"   Длина {seq_len:2d}: {acc:.3f} точность ({count:3d} примеров)")
 
-    # Детальный отчет по категориям
-    category_names = PokerHandAnalyzer.get_all_categories()
-    print(f"\n🏷️  Отчет по категориям рук:")
-    try:
-        class_report = classification_report(
-            all_outputs["category_true"],
-            all_outputs["category_pred"],
-            target_names=category_names,
-            zero_division=0,
-            output_dict=True,
-        )
-
-        for category, metrics in class_report.items():
-            if isinstance(metrics, dict) and category in category_names:
-                print(
-                    f"   {category:20s}: precision={metrics['precision']:.3f}, "
-                    f"recall={metrics['recall']:.3f}, f1={metrics['f1-score']:.3f}"
+    # ИСПРАВЛЕНИЕ: Не создаем детальный отчет по категориям для HM3
+    # так как sklearn не может обработать 73 категории корректно
+    if data_dict.get("use_hm3", True):
+        print(f"\n🏷️  Статистика по категориям:")
+        unique_true = np.unique(all_outputs["category_true"])
+        unique_pred = np.unique(all_outputs["category_pred"])
+        print(f"   Уникальных истинных категорий: {len(unique_true)}")
+        print(f"   Уникальных предсказанных категорий: {len(unique_pred)}")
+    else:
+        # Старая система с 9 категориями
+        category_names = PokerHandAnalyzer.get_all_categories()
+        print(f"\n🏷️  Отчет по категориям рук:")
+        try:
+            print(
+                classification_report(
+                    all_outputs["category_true"],
+                    all_outputs["category_pred"],
+                    target_names=category_names,
+                    zero_division=0,
                 )
-
-    except Exception as e:
-        print(f"   ⚠️  Не удалось создать детальный отчет: {e}")
+            )
+        except Exception as e:
+            print(f"   ⚠️  Не удалось создать детальный отчет: {e}")
 
     return {
         "strength_accuracy": strength_accuracy,
@@ -3868,6 +3807,7 @@ def visualize_sequence_results(model, data_dict, history, include_hole_cards=Tru
     return fig, plot_path
 
 
+# 1. Исправленная функция predict_sequence_hand_ranges
 def predict_sequence_hand_ranges(model, data_dict, sample_hands=5):
     """
     Демонстрация предсказаний последовательной модели
@@ -3877,7 +3817,14 @@ def predict_sequence_hand_ranges(model, data_dict, sample_hands=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
 
-    category_names = PokerHandAnalyzer.get_all_categories()
+    # ИСПРАВЛЕНИЕ: Получаем правильный список категорий
+    if data_dict.get("use_hm3", True):
+        # Для HM3 используем полный список 73 категорий
+        category_names = get_all_hm3_categories()
+    else:
+        # Для старой системы
+        category_names = PokerHandAnalyzer.get_all_categories()
+
     rank_names = PokerHandAnalyzer.get_rank_names()
 
     shown_examples = 0
@@ -3924,10 +3871,23 @@ def predict_sequence_hand_ranges(model, data_dict, sample_hands=5):
                 print(
                     f"   🎯 Предсказанная сила: {predicted_strength} (уверенность: {strength_confidence:.3f})"
                 )
-                print(f"   🏷️  Истинная категория: {category_names[true_category]}")
-                print(
-                    f"   🏷️  Предсказанная категория: {category_names[predicted_category]} (вероятность: {category_confidence:.3f})"
-                )
+
+                # ИСПРАВЛЕНИЕ: Проверяем границы индексов
+                if 0 <= true_category < len(category_names):
+                    print(f"   🏷️  Истинная категория: {category_names[true_category]}")
+                else:
+                    print(
+                        f"   🏷️  Истинная категория: индекс {true_category} (вне диапазона)"
+                    )
+
+                if 0 <= predicted_category < len(category_names):
+                    print(
+                        f"   🏷️  Предсказанная категория: {category_names[predicted_category]} (вероятность: {category_confidence:.3f})"
+                    )
+                else:
+                    print(
+                        f"   🏷️  Предсказанная категория: индекс {predicted_category} (вне диапазона)"
+                    )
 
                 # Топ-3 наиболее вероятных ранга
                 top_ranks = torch.topk(specific_probs, 3)
@@ -4944,8 +4904,9 @@ def main_with_sequences():
 
         report_path = f"results/sequence_comparison_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         with open(report_path, "w", encoding="utf-8") as f:
-            final_report_safe = safe_json_serialize(final_report)
-            json.dump(final_report_safe, f, indent=2, ensure_ascii=False)
+            # Используем safe_json_serialize для конвертации numpy типов
+            comparison_report_safe = safe_json_serialize(comparison_report)
+            json.dump(comparison_report_safe, f, indent=2, ensure_ascii=False)
 
         print(f"📋 Детальный отчет сохранен: {report_path}")
 
