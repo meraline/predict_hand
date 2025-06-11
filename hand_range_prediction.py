@@ -317,6 +317,11 @@ class PokerHandEvaluator:
                 hole_suited = [r for r, s in hole if s == suit]
                 board_suited = [r for r, s in board if s == suit]
 
+                # ИСПРАВЛЕНИЕ: Проверяем, что hole_suited не пустой
+                if not hole_suited:
+                    # Флеш полностью на борде
+                    continue
+
                 # Определяем силу флеша
                 if 14 in hole_suited:  # Туз у игрока
                     if len(board_suited) == 3:
@@ -388,7 +393,12 @@ class PokerHandEvaluator:
 
                 # Трипс (одна карта в руке)
                 else:
-                    kicker = max(r for r in hole_ranks if r != rank)
+                    # ИСПРАВЛЕНИЕ: Проверяем, что есть карты для кикера
+                    kicker_candidates = [r for r in hole_ranks if r != rank]
+                    if not kicker_candidates:
+                        return "LowTripsLowKicker"
+
+                    kicker = max(kicker_candidates)
                     board_higher = [r for r in board_ranks if r > rank]
 
                     if len(board_higher) == 0:  # Топ трипс
@@ -486,7 +496,12 @@ class PokerHandEvaluator:
 
             # Пара с бордом
             elif pair_rank in hole_ranks:
-                kicker = max(r for r in hole_ranks if r != pair_rank)
+                # ИСПРАВЛЕНИЕ: Проверяем наличие кикера
+                kicker_candidates = [r for r in hole_ranks if r != pair_rank]
+                if not kicker_candidates:
+                    kicker = 2  # Минимальный ранг
+                else:
+                    kicker = max(kicker_candidates)
 
                 # Проверяем, есть ли pair_rank в board_ranks перед использованием index()
                 if pair_rank in board_ranks:
@@ -518,6 +533,7 @@ class PokerHandEvaluator:
             # Пара на борде
             else:
                 if board_ranks:
+                    # ИСПРАВЛЕНИЕ: Проверяем, что board_ranks не пустой
                     overcards = sum(1 for r in hole_ranks if r > max(board_ranks))
                     if overcards == 0:
                         return "PairedBoardNoOvercards"
@@ -568,6 +584,10 @@ class PokerHandEvaluator:
                         return "OneCardLowFlushDraw"
             elif count == 3 and len(board) == 3:  # Бэкдорное флеш-дро
                 hole_suited = [r for r, s in hole if s == suit]
+                # ИСПРАВЛЕНИЕ: Проверяем, что hole_suited не пустой
+                if not hole_suited:
+                    continue
+
                 if len(hole_suited) == 2:
                     if 14 in hole_suited:
                         return "TwoCardBackdoorNutFlushDraw"
@@ -657,39 +677,48 @@ class PokerHandEvaluator:
 
 # Функция для добавления в препроцессинг данных
 def add_hand_evaluation_to_dataframe(df):
-    """
-    Добавляет оценку типа руки и силы к DataFrame
-
-    Args:
-        df: DataFrame с колонками Showdown_1, Showdown_2, Card1-Card5
-
-    Returns:
-        df: DataFrame с добавленными колонками hand_type_hm3 и hand_strength_class
-    """
+    """Добавляет оценку типа руки и силы к DataFrame"""
     evaluator = PokerHandEvaluator()
 
     hand_types = []
     strength_classes = []
+    errors_count = 0
 
     for idx, row in df.iterrows():
-        # Карты игрока
-        hole_cards = [row.get("Showdown_1"), row.get("Showdown_2")]
+        try:
+            # Карты игрока
+            hole_cards = [row.get("Showdown_1"), row.get("Showdown_2")]
 
-        # Карты борда
-        board_cards = []
-        for i in range(1, 6):
-            card = row.get(f"Card{i}")
-            if pd.notna(card) and card:
-                board_cards.append(card)
+            # Карты борда
+            board_cards = []
+            for i in range(1, 6):
+                card = row.get(f"Card{i}")
+                if pd.notna(card) and card:
+                    board_cards.append(card)
 
-        # Оцениваем руку
-        if all(pd.notna(c) for c in hole_cards):
-            hand_type, strength_class = evaluator.evaluate_hand(hole_cards, board_cards)
-        else:
+            # Оцениваем руку
+            if all(pd.notna(c) for c in hole_cards):
+                hand_type, strength_class = evaluator.evaluate_hand(
+                    hole_cards, board_cards
+                )
+            else:
+                hand_type, strength_class = "Other", 0
+
+        except Exception as e:
+            errors_count += 1
+            if errors_count < 10:  # Показываем только первые 10 ошибок
+                print(f"⚠️ Ошибка в строке {idx}: {e}")
             hand_type, strength_class = "Other", 0
 
         hand_types.append(hand_type)
         strength_classes.append(strength_class)
+
+        # Прогресс для больших данных
+        if idx > 0 and idx % 10000 == 0:
+            print(f"   Обработано {idx:,} / {len(df):,} строк...")
+
+    if errors_count > 0:
+        print(f"⚠️ Всего ошибок при оценке рук: {errors_count}")
 
     df["hand_type_hm3"] = hand_types
     df["hand_strength_class"] = strength_classes
