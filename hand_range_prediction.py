@@ -835,8 +835,40 @@ class SequenceHandRangeDataset(Dataset):
 
         for idx, seq_df in enumerate(sequences):
             try:
+                # Проверяем наличие всех необходимых колонок
+                # Пробуем сначала со _scaled, затем без
+                available_columns = []
+                for col in feature_columns:
+                    if f"{col}_scaled" in seq_df.columns:
+                        available_columns.append(f"{col}_scaled")
+                    elif col in seq_df.columns:
+                        available_columns.append(col)
+                    else:
+                        # Колонка отсутствует - заполняем нулями
+                        print(f"⚠️ Колонка {col} отсутствует в последовательности {idx}")
+
+                if len(available_columns) == 0:
+                    print(f"❌ Нет доступных признаков в последовательности {idx}")
+                    continue
+
                 # Извлекаем признаки
-                features = seq_df[feature_columns].values.astype(np.float32)
+                features = seq_df[available_columns].values.astype(np.float32)
+
+                # Дополняем недостающие колонки нулями
+                if len(available_columns) < len(feature_columns):
+                    # Создаем полную матрицу признаков
+                    full_features = np.zeros(
+                        (len(features), len(feature_columns)), dtype=np.float32
+                    )
+
+                    # Заполняем доступные признаки
+                    for i, col in enumerate(feature_columns):
+                        if f"{col}_scaled" in seq_df.columns:
+                            full_features[:, i] = seq_df[f"{col}_scaled"].values
+                        elif col in seq_df.columns:
+                            full_features[:, i] = seq_df[col].values
+
+                    features = full_features
 
                 # Проверяем на валидность
                 if not np.any(np.isnan(features)) and len(features) > 0:
@@ -844,7 +876,7 @@ class SequenceHandRangeDataset(Dataset):
                     self.valid_indices.append(idx)
 
             except Exception as e:
-                # Пропускаем проблемные последовательности
+                print(f"⚠️ Ошибка обработки последовательности {idx}: {e}")
                 continue
 
         print(
@@ -2626,10 +2658,10 @@ def prepare_sequence_hand_range_data_with_hm3(
     include_hole_cards=True,
     max_sequence_length="auto",
     balance_strategy="adaptive",
-    use_hm3_classification=True,  # Новый параметр
+    use_hm3_classification=True,
 ):
     """
-    Подготовка данных с HM3 классификацией рук
+    Подготовка данных с HM3 классификацией рук (ИСПРАВЛЕННАЯ ВЕРСИЯ)
     """
     print(f"🎯 === ПОДГОТОВКА ДАННЫХ С ПОСЛЕДОВАТЕЛЬНОСТЯМИ ===")
 
@@ -2651,16 +2683,22 @@ def prepare_sequence_hand_range_data_with_hm3(
         print("❌ Нет записей с открытыми картами!")
         return None
 
-    # НОВОЕ: Добавляем HM3 классификацию
+    # ИСПРАВЛЕНИЕ: Выполняем анализ рук ТОЛЬКО ОДИН РАЗ
     if use_hm3_classification:
         print("🃏 Анализ рук по системе HM3 (73 типа)...")
         df_filtered = add_hand_evaluation_to_dataframe(df_filtered)
 
-        # Используем HM3 классификацию вместо старой
-        df_filtered["hand_strength"] = df_filtered["hand_strength_class"]
+        # Используем HM3 классификацию
+        df_filtered["hand_strength"] = df_filtered["hand_strength_class"].clip(0, 4)
         df_filtered["hand_category"] = df_filtered["hand_type_hm3"]
+
+        # Проверяем диапазон значений
+        print(
+            f"   ✅ Диапазон силы руки: {df_filtered['hand_strength'].min()}-{df_filtered['hand_strength'].max()}"
+        )
+        print(f"   ✅ Количество классов: 5 (0-4)")
     else:
-        # Старая система (префлоп сила)
+        # Старая система - преобразуем 0-9 в 0-4
         print("🔍 Анализ силы рук (старая система)...")
         analyzer = PokerHandAnalyzer()
         hand_analysis = df_filtered.apply(
@@ -2669,8 +2707,15 @@ def prepare_sequence_hand_range_data_with_hm3(
             ),
             axis=1,
         )
-        df_filtered["hand_strength"] = [x[0] for x in hand_analysis]
+
+        # Преобразуем 10 классов (0-9) в 5 классов (0-4)
+        old_strength = [x[0] for x in hand_analysis]
+        df_filtered["hand_strength"] = [
+            min(4, s // 2) for s in old_strength
+        ]  # 0-1 -> 0, 2-3 -> 1, etc.
         df_filtered["hand_category"] = [x[1] for x in hand_analysis]
+
+        print(f"   ✅ Преобразование: 10 классов (0-9) → 5 классов (0-4)")
 
     # Стандартизация названий колонок
     column_mapping = {
@@ -2698,42 +2743,19 @@ def prepare_sequence_hand_range_data_with_hm3(
     if "HandID" not in df_filtered.columns:
         df_filtered["HandID"] = df_filtered.get("Hand", df_filtered.index // 10)
 
+    # Вывод статистики ТОЛЬКО ОДИН РАЗ
     print(f"✅ Анализ завершен. Распределение силы рук:")
     strength_dist = df_filtered["hand_strength"].value_counts().sort_index()
 
-    if use_hm3_classification:
-        class_names = ["Мусор/Дро", "Слабые", "Средние", "Сильные", "Монстры"]
-        for strength, count in strength_dist.items():
-            name = (
-                class_names[strength]
-                if strength < len(class_names)
-                else f"Класс {strength}"
-            )
-            print(f"   {name}: {count} рук ({count/len(df_filtered)*100:.1f}%)")
-    else:
-        for strength, count in strength_dist.items():
-            print(
-                f"   Сила {strength}: {count} рук ({count/len(df_filtered)*100:.1f}%)"
-            )
-
-    # Анализ рук и создание целевых переменных
-    print("🔍 Анализ силы рук...")
-    analyzer = PokerHandAnalyzer()
-
-    hand_analysis = df_filtered.apply(
-        lambda row: analyzer.analyze_hand_strength(
-            row["Showdown_1"], row["Showdown_2"]
-        ),
-        axis=1,
-    )
-
-    df_filtered["hand_strength"] = [x[0] for x in hand_analysis]
-    df_filtered["hand_category"] = [x[1] for x in hand_analysis]
-
-    print(f"✅ Анализ завершен. Распределение силы рук:")
-    strength_dist = df_filtered["hand_strength"].value_counts().sort_index()
+    class_names = ["Мусор/Дро", "Слабые", "Средние", "Сильные", "Монстры"]
     for strength, count in strength_dist.items():
-        print(f"   Сила {strength}: {count} рук ({count/len(df_filtered)*100:.1f}%)")
+        if 0 <= strength < len(class_names):
+            print(
+                f"   {class_names[strength]}: {count} рук ({count/len(df_filtered)*100:.1f}%)"
+            )
+
+    # УДАЛЯЕМ дублирующий анализ рук!
+    # Больше НЕ вызываем analyzer.analyze_hand_strength здесь
 
     # Умное разделение данных
     print(f"\n🎯 Разделение данных...")
@@ -2757,6 +2779,7 @@ def prepare_sequence_hand_range_data_with_hm3(
     ]
 
     # Добавляем карты стола
+    analyzer = PokerHandAnalyzer()  # Создаем только для парсинга карт
     board_columns = ["Card1", "Card2", "Card3", "Card4", "Card5"]
     for col in board_columns:
         if col in df_filtered.columns:
@@ -2806,15 +2829,17 @@ def prepare_sequence_hand_range_data_with_hm3(
         )
         feature_columns.append("TypeBuyIn_encoded")
 
-    # Копируем кодированные признаки в разделенные датафреймы
+    # Копируем все необходимые колонки в разделенные датафреймы
     for split_df in [train_df, val_df, test_df]:
         for col in df_filtered.columns:
-            if (
-                col.endswith("_encoded")
-                or col.endswith("_rank")
-                or col.endswith("_suit")
-            ):
-                split_df[col] = df_filtered.loc[split_df.index, col]
+            if col in feature_columns or col in [
+                "hand_strength",
+                "hand_category",
+                "Showdown_1",
+                "Showdown_2",
+            ]:
+                if col not in split_df.columns:
+                    split_df[col] = df_filtered.loc[split_df.index, col]
 
     # Обработка проблемных значений
     print("🧹 Очистка данных...")
@@ -2871,10 +2896,16 @@ def prepare_sequence_hand_range_data_with_hm3(
         index=test_df.index,
     )
 
+    # Добавляем масштабированные данные обратно
+    for col in available_features:
+        train_df[f"{col}_scaled"] = train_scaled[col]
+        val_df[f"{col}_scaled"] = val_scaled[col]
+        test_df[f"{col}_scaled"] = test_scaled[col]
+
     # Создание последовательностей для каждой выборки
     print(f"\n🔄 Создание последовательностей...")
 
-    # Автоматическое определение длины последовательности
+    # Автоматическое определение длины
     if max_sequence_length == "auto":
         sequence_params = analyze_optimal_sequence_length(df_filtered)
         max_sequence_length = sequence_params["max_length"]
@@ -2882,65 +2913,69 @@ def prepare_sequence_hand_range_data_with_hm3(
             f"\n✅ Автоматически определена максимальная длина: {max_sequence_length}"
         )
     else:
-        # Если задано вручную, создаем параметры
-        sequence_params = {
-            "min_length": 3,
-            "recommended_length": min(10, max_sequence_length),
-            "max_length": max_sequence_length,
-        }
+        max_sequence_length = int(max_sequence_length)
 
-    # Создание последовательностей с адаптивными параметрами
-    train_sequences, train_info, _ = create_adaptive_sequences(
-        train_df, sequence_params, balance_strategy
-    )
+    # Создаем последовательности с правильными признаками
+    scaled_features = [f"{col}_scaled" for col in available_features]
 
     # Train последовательности
-    train_sequences, train_seq_info = create_player_sequences(
+    train_sequences, _ = create_player_sequences(
         train_df, max_sequence_length=max_sequence_length
     )
-    train_sequences_with_targets, train_targets = create_sequences_with_targets(
-        train_sequences, available_features, train_scaled
+    train_sequences_final, train_targets, num_categories = (
+        create_sequences_with_targets_fixed(
+            train_sequences, scaled_features, use_hm3=use_hm3_classification
+        )
     )
 
     # Validation последовательности
-    val_sequences, val_seq_info = create_player_sequences(
+    val_sequences, _ = create_player_sequences(
         val_df, max_sequence_length=max_sequence_length
     )
-    val_sequences_with_targets, val_targets = create_sequences_with_targets(
-        val_sequences, available_features, val_scaled
+    val_sequences_final, val_targets, num_categories_val = (
+        create_sequences_with_targets_fixed(
+            val_sequences, scaled_features, use_hm3=use_hm3_classification
+        )
     )
 
     # Test последовательности
-    test_sequences, test_seq_info = create_player_sequences(
+    test_sequences, _ = create_player_sequences(
         test_df, max_sequence_length=max_sequence_length
     )
-    test_sequences_with_targets, test_targets = create_sequences_with_targets(
-        test_sequences, available_features, test_scaled
+    test_sequences_final, test_targets, num_categories_test = (
+        create_sequences_with_targets_fixed(
+            test_sequences, scaled_features, use_hm3=use_hm3_classification
+        )
     )
+
+    # Проверка консистентности
+    assert (
+        num_categories == num_categories_val == num_categories_test
+    ), f"Несоответствие категорий: train={num_categories}, val={num_categories_val}, test={num_categories_test}"
+
+    print(f"\n✅ Все выборки имеют одинаковое количество категорий: {num_categories}")
 
     # Создание датасетов
     print("📦 Создание датасетов...")
 
     train_dataset = SequenceHandRangeDataset(
-        train_sequences_with_targets,
+        train_sequences_final,
         available_features,
         train_targets,
         max_sequence_length,
     )
     val_dataset = SequenceHandRangeDataset(
-        val_sequences_with_targets, available_features, val_targets, max_sequence_length
+        val_sequences_final, available_features, val_targets, max_sequence_length
     )
     test_dataset = SequenceHandRangeDataset(
-        test_sequences_with_targets,
+        test_sequences_final,
         available_features,
         test_targets,
         max_sequence_length,
     )
 
     # DataLoaders
-    batch_size = min(
-        16, max(2, len(train_dataset) // 8)
-    )  # Меньший batch_size для последовательностей
+    batch_size = min(16, max(2, len(train_dataset) // 8))
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -2951,6 +2986,7 @@ def prepare_sequence_hand_range_data_with_hm3(
     print(f"   🔍 Validation: {len(val_dataset)} последовательностей")
     print(f"   🧪 Test: {len(test_dataset)} последовательностей")
     print(f"   📦 Размер батча: {batch_size}")
+    print(f"   🏷️  Количество категорий HM3: {num_categories}")
 
     return {
         "train_loader": train_loader,
@@ -2962,92 +2998,247 @@ def prepare_sequence_hand_range_data_with_hm3(
         "input_dim": len(available_features),
         "max_sequence_length": max_sequence_length,
         "include_hole_cards": include_hole_cards,
-        "train_sequences": train_sequences_with_targets,
-        "val_sequences": val_sequences_with_targets,
-        "test_sequences": test_sequences_with_targets,
+        "use_hm3": use_hm3_classification,
+        "num_strength_classes": 5,  # Всегда 5 для HM3
+        "num_categories": num_categories,  # 73 для HM3, 9 для старой системы
+        "category_mapping": (
+            category_mapping if "category_mapping" in locals() else None
+        ),
     }
 
 
-def create_sequences_with_targets(sequences, feature_columns, scaled_data_dict):
+# 5. Дополнительная функция для сохранения маппинга категорий
+def save_hm3_categories_mapping():
     """
-    Создает последовательности с правильно подготовленными целевыми переменными
+    Сохраняет полный маппинг HM3 категорий для последующего использования
+    """
+    all_categories = get_all_hm3_categories()
+    category_mapping = {cat: i for i, cat in enumerate(all_categories)}
+
+    # Группируем по силе
+    evaluator = PokerHandEvaluator()
+    categories_by_strength = defaultdict(list)
+
+    for cat in all_categories:
+        strength = evaluator.hand_type_to_strength[cat]
+        categories_by_strength[strength].append(cat)
+
+    mapping_info = {
+        "total_categories": len(all_categories),
+        "category_to_index": category_mapping,
+        "index_to_category": {i: cat for cat, i in category_mapping.items()},
+        "categories_by_strength": dict(categories_by_strength),
+        "strength_names": {
+            0: "Мусор/Дро",
+            1: "Слабые",
+            2: "Средние",
+            3: "Сильные",
+            4: "Монстры",
+        },
+        "all_categories": all_categories,
+    }
+
+    os.makedirs("results", exist_ok=True)
+    with open("results/hm3_categories_mapping.json", "w", encoding="utf-8") as f:
+        json.dump(mapping_info, f, indent=2, ensure_ascii=False)
+
+    print(
+        "💾 Сохранен полный маппинг HM3 категорий: results/hm3_categories_mapping.json"
+    )
+    return mapping_info
+
+
+# 1. Добавьте эту функцию для получения всех HM3 категорий
+def get_all_hm3_categories():
+    """
+    Возвращает полный список всех возможных HM3 категорий (73 типа)
+    """
+    evaluator = PokerHandEvaluator()
+    # Все категории из маппинга силы рук
+    all_categories = list(evaluator.hand_type_to_strength.keys())
+    # Сортируем для консистентности
+    return sorted(all_categories)
+
+
+# 2. Дополнительная проверка в create_sequences_with_targets_fixed
+def create_sequences_with_targets_fixed(sequences, feature_columns, use_hm3=True):
+    """
+    Создает последовательности с фиксированным набором категорий (v2)
     """
     print(f"🎯 Создание {len(sequences)} последовательностей с целевыми переменными...")
 
+    if use_hm3:
+        # Используем ВСЕ возможные HM3 категории (73 типа)
+        all_possible_categories = get_all_hm3_categories()
+        category_mapping = {cat: i for i, cat in enumerate(all_possible_categories)}
+        num_categories = len(all_possible_categories)  # Всегда 73
+
+        print(f"   🏷️  Используется полный набор HM3 категорий: {num_categories}")
+        print(
+            f"   📋 Категории: {all_possible_categories[:10]}... (показаны первые 10)"
+        )
+
+        # Проверяем какие категории есть в данных
+        found_categories = set()
+        for seq_df in sequences:
+            if "hand_category" in seq_df.columns:
+                found_categories.update(seq_df["hand_category"].dropna().unique())
+
+        print(
+            f"   📊 Найдено в данных: {len(found_categories)} из {num_categories} категорий"
+        )
+
+        # Предупреждаем о неизвестных категориях
+        unknown_categories = found_categories - set(all_possible_categories)
+        if unknown_categories:
+            print(f"   ⚠️  Неизвестные категории в данных: {unknown_categories}")
+            print(f"      Они будут отображены на категорию 'Other'")
+    else:
+        category_mapping = PokerHandAnalyzer.get_category_mapping()
+        num_categories = 9
+        print(f"   🏷️  Используются стандартные 9 категорий")
+
+    # Создаем целевые переменные
     targets = {"hand_strength": [], "category_probs": [], "specific_hand": []}
     valid_sequences = []
     analyzer = PokerHandAnalyzer()
 
-    for seq_df in sequences:
+    # Статистика по категориям
+    category_counts = defaultdict(int)
+
+    for seq_idx, seq_df in enumerate(sequences):
         try:
-            # Проверяем что последовательность не пустая
             if len(seq_df) == 0:
                 continue
 
-            # Берем целевую переменную с последней записи в последовательности
             last_row = seq_df.iloc[-1]
 
-            # Проверяем наличие нужных данных
-            if (
+            # Проверяем наличие необходимых данных
+            if not (
                 pd.notna(last_row.get("hand_strength"))
                 and pd.notna(last_row.get("Showdown_1"))
                 and pd.notna(last_row.get("Showdown_2"))
             ):
+                continue
 
-                # Сила руки
-                targets["hand_strength"].append(int(last_row["hand_strength"]))
+            # Сила руки (0-4)
+            strength = int(last_row["hand_strength"])
+            if strength < 0 or strength > 4:
+                print(f"   ⚠️  Seq {seq_idx}: неверная сила руки {strength}, пропускаем")
+                continue
 
-                # Категория руки
-                category_mapping = PokerHandAnalyzer.get_category_mapping()
+            targets["hand_strength"].append(strength)
+
+            # Категория руки
+            category_probs = np.zeros(num_categories)
+
+            if (
+                use_hm3
+                and "hand_category" in last_row
+                and pd.notna(last_row["hand_category"])
+            ):
+                category = last_row["hand_category"]
+                # Если категория неизвестна, используем 'Other'
+                if category not in category_mapping:
+                    category = "Other"
+                    if seq_idx < 5:  # Логируем только первые несколько
+                        print(
+                            f"   📝 Seq {seq_idx}: неизвестная категория '{last_row['hand_category']}' -> 'Other'"
+                        )
+
+                category_idx = category_mapping[category]
+                category_counts[category] += 1
+            else:
+                # Для не-HM3 или отсутствующих категорий
+                category = last_row.get("hand_category", "other")
                 category_idx = category_mapping.get(
-                    last_row.get("hand_category", "other"), 8
-                )
+                    category, 8
+                )  # 8 = 'other' в старой системе
+                category_counts[category] += 1
 
-                category_probs = np.zeros(9)
-                category_probs[category_idx] = 1.0
-                targets["category_probs"].append(category_probs)
+            category_probs[category_idx] = 1.0
+            targets["category_probs"].append(category_probs)
 
-                # Конкретные ранги карт
-                specific_hand = np.zeros(13)
-                card1 = last_row["Showdown_1"]
-                card2 = last_row["Showdown_2"]
+            # Конкретные ранги карт
+            specific_hand = create_specific_hand_vector(
+                last_row["Showdown_1"], last_row["Showdown_2"], analyzer
+            )
+            targets["specific_hand"].append(specific_hand)
 
-                rank1, _ = analyzer.parse_card(card1)
-                rank2, _ = analyzer.parse_card(card2)
-
-                if rank1 is not None and rank2 is not None:
-                    # Преобразуем ранги в индексы (A=14 -> 12, K=13 -> 11, ..., 2=2 -> 0)
-                    rank1_idx = max(0, min(12, rank1 - 2))
-                    rank2_idx = max(0, min(12, rank2 - 2))
-
-                    specific_hand[rank1_idx] = 0.6
-                    specific_hand[rank2_idx] = 0.6
-
-                    # Немного вероятности на соседние ранги
-                    for offset in [-1, 1]:
-                        for rank_idx in [rank1_idx, rank2_idx]:
-                            neighbor_idx = rank_idx + offset
-                            if 0 <= neighbor_idx < 13:
-                                specific_hand[neighbor_idx] = 0.1
-
-                    # Нормализуем
-                    if specific_hand.sum() > 0:
-                        specific_hand = specific_hand / specific_hand.sum()
-                    else:
-                        specific_hand = np.ones(13) / 13
-                else:
-                    specific_hand = np.ones(13) / 13
-
-                targets["specific_hand"].append(specific_hand)
-                valid_sequences.append(seq_df)
+            valid_sequences.append(seq_df)
 
         except Exception as e:
-            # Пропускаем проблемные последовательности
+            print(f"   ⚠️  Ошибка в последовательности {seq_idx}: {e}")
             continue
 
     print(f"   ✅ Создано {len(valid_sequences)} валидных последовательностей")
+    print(f"   🏷️  Фиксированная размерность category_probs: {num_categories}")
 
-    return valid_sequences, targets
+    # Показываем топ категорий
+    if category_counts:
+        top_categories = sorted(
+            category_counts.items(), key=lambda x: x[1], reverse=True
+        )[:10]
+        print(f"   📊 Топ-10 категорий в данных:")
+        for cat, count in top_categories:
+            print(f"      {cat}: {count} ({count/len(valid_sequences)*100:.1f}%)")
+
+    # Проверка диапазона значений силы
+    if targets["hand_strength"]:
+        min_strength = min(targets["hand_strength"])
+        max_strength = max(targets["hand_strength"])
+        print(f"   💪 Диапазон силы руки: {min_strength}-{max_strength}")
+
+        # Распределение силы
+        strength_dist = defaultdict(int)
+        for s in targets["hand_strength"]:
+            strength_dist[s] += 1
+        print(f"   📊 Распределение силы:")
+        for s in sorted(strength_dist.keys()):
+            print(
+                f"      {s}: {strength_dist[s]} ({strength_dist[s]/len(targets['hand_strength'])*100:.1f}%)"
+            )
+
+    return valid_sequences, targets, num_categories
+
+
+# 3. Вспомогательная функция для создания вектора specific_hand
+def create_specific_hand_vector(card1, card2, analyzer):
+    """
+    Создает вектор вероятностей для конкретных рангов карт
+    """
+    specific_hand = np.zeros(13)
+
+    rank1, _ = analyzer.parse_card(card1)
+    rank2, _ = analyzer.parse_card(card2)
+
+    if rank1 is not None and rank2 is not None:
+        # Индексы рангов (0-12 для 2-A)
+        rank1_idx = max(0, min(12, rank1 - 2))
+        rank2_idx = max(0, min(12, rank2 - 2))
+
+        # Основные ранги
+        specific_hand[rank1_idx] = 0.6
+        specific_hand[rank2_idx] = 0.6
+
+        # Добавляем вероятность на соседние ранги (блеф/полублеф)
+        for offset in [-1, 1]:
+            for rank_idx in [rank1_idx, rank2_idx]:
+                neighbor_idx = rank_idx + offset
+                if 0 <= neighbor_idx < 13:
+                    specific_hand[neighbor_idx] = 0.1
+
+        # Нормализация
+        total = specific_hand.sum()
+        if total > 0:
+            specific_hand = specific_hand / total
+        else:
+            specific_hand = np.ones(13) / 13
+    else:
+        # Равномерное распределение если карты не распознаны
+        specific_hand = np.ones(13) / 13
+
+    return specific_hand
 
 
 def create_player_sequences(df, max_sequence_length=20, min_sequence_length=3):
@@ -3152,11 +3343,12 @@ def create_player_sequences(df, max_sequence_length=20, min_sequence_length=3):
     return sequences, sequence_info
 
 
+# 1. Обновленная функция train_sequence_hand_range_model
 def train_sequence_hand_range_model(
     data_dict, hidden_dim=128, num_layers=3, epochs=25, lr=0.001
 ):
     """
-    Обучение RWKV модели с поддержкой последовательностей
+    Обучение RWKV модели с поддержкой последовательностей (ИСПРАВЛЕННАЯ)
     """
     print(f"🚀 === ОБУЧЕНИЕ RWKV МОДЕЛИ С ПОСЛЕДОВАТЕЛЬНОСТЯМИ ===")
 
@@ -3177,12 +3369,22 @@ def train_sequence_hand_range_model(
         print("❌ Пустая обучающая выборка!")
         return None, None
 
-    # Создание модели
+    # ИСПРАВЛЕНИЕ: Получаем правильное количество категорий из data_dict
+    num_categories = data_dict.get("num_categories", 73)
+    num_strength_classes = data_dict.get("num_strength_classes", 5)
+
+    print(f"📊 Параметры классификации:")
+    print(f"   🏷️  Количество категорий: {num_categories}")
+    print(f"   💪 Количество классов силы: {num_strength_classes}")
+
+    # Создание модели с правильными параметрами
     model = SequenceHandRangeRWKV(
         input_dim=data_dict["input_dim"],
         hidden_dim=hidden_dim,
         num_layers=num_layers,
         max_sequence_length=data_dict["max_sequence_length"],
+        num_strength_classes=num_strength_classes,  # Передаем из data_dict
+        num_categories=num_categories,  # Передаем реальное количество категорий
     ).to(device)
 
     print(f"🧠 Модель создана:")
@@ -3190,6 +3392,8 @@ def train_sequence_hand_range_model(
     print(f"   🧮 Скрытых нейронов: {hidden_dim}")
     print(f"   🏗️  Слоев RWKV: {num_layers}")
     print(f"   📏 Макс. длина последовательности: {data_dict['max_sequence_length']}")
+    print(f"   🏷️  Выходных категорий: {num_categories}")
+    print(f"   💪 Выходных классов силы: {num_strength_classes}")
 
     # Оптимизатор и планировщик
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -4461,12 +4665,15 @@ def combine_percentage_of_files(percentage):
 
 
 def main_with_sequences():
-    """Обновленная главная функция с поддержкой выбора процента файлов"""
-    print("🎰 === ОБУЧЕНИЕ RWKV МОДЕЛЕЙ С ПОСЛЕДОВАТЕЛЬНОСТЯМИ ===\n")
+    """Обновленная главная функция с поддержкой HM3"""
+    print("🎰 === ОБУЧЕНИЕ RWKV МОДЕЛЕЙ С ПОСЛЕДОВАТЕЛЬНОСТЯМИ (HM3) ===\n")
 
     # Создаем необходимые папки
     setup_directories()
     save_categories_json()
+
+    # Сохраняем маппинг HM3 категорий
+    save_hm3_categories_mapping()
 
     # Выбираем файл данных с новой функцией
     data_choice = choose_data_file_with_percentage()
