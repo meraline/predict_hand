@@ -21,17 +21,725 @@ import glob
 from datetime import datetime
 
 
+def safe_json_serialize(obj):
+    """Безопасная конвертация всех типов для JSON"""
+    import numpy as np
+
+    if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+        return float(obj)
+    elif isinstance(obj, (np.bool_, np.bool8)):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: safe_json_serialize(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [safe_json_serialize(item) for item in obj]
+    else:
+        return obj
+
+
+import itertools
+from collections import Counter
+
+
+class PokerHandEvaluator:
+    """Класс для определения типа руки из 73 комбинаций HM3"""
+
+    RANK_VALUES = {
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+        "6": 6,
+        "7": 7,
+        "8": 8,
+        "9": 9,
+        "T": 10,
+        "J": 11,
+        "Q": 12,
+        "K": 13,
+        "A": 14,
+    }
+
+    SUIT_MAP = {"s": 0, "h": 1, "d": 2, "c": 3}
+
+    def __init__(self):
+        self.hand_type_to_strength = self._create_strength_mapping()
+
+    def _create_strength_mapping(self):
+        """Создает маппинг типов рук в 5 классов силы"""
+        return {
+            # Класс 4: МОНСТРЫ
+            "TwoCardStraightFlush": 4,
+            "OneCardStraightFlush": 4,
+            "FourOfAKindWithPocketPair": 4,
+            "FourOfAKindWithoutPocketPair": 4,
+            "FourOfAKindOnBoard": 4,
+            "OneCardFullHouseTopPair": 4,
+            "OneCardFullHouseTripsOnBoard": 4,
+            "FullHouseWithPocketPairNoTripsOnBoard": 4,
+            "TwoCardFullHouseWithoutPocketPair": 4,
+            "FullHouseWithPocketPairTripsOnBoard": 4,
+            "ThreeFlushBoardNutFlush": 4,
+            "FourFlushBoardNutFlush": 4,
+            "TwoCardNutStraight": 4,
+            "OneCardNutStraight": 4,
+            # Класс 3: СИЛЬНЫЕ
+            "ThreeFlushBoardHighFlush": 3,
+            "FourFlushBoardHighFlush": 3,
+            "TwoCardStraight": 3,
+            "OneCardStraight": 3,
+            "HighSet": 3,
+            "SecondSet": 3,
+            "LowSet": 3,
+            "HighTripsHighKicker": 3,
+            "HighTripsLowKicker": 3,
+            "TopTwoPair": 3,
+            # Класс 2: СРЕДНИЕ
+            "ThreeFlushBoardLowFlush": 2,
+            "FourFlushBoardLowFlush": 2,
+            "SecondTripsHighKicker": 2,
+            "SecondTripsLowKicker": 2,
+            "LowTripsHighKicker": 2,
+            "LowTripsLowKicker": 2,
+            "TripsOnBoard": 2,
+            "TopPairPlusPair": 2,
+            "NonTopTwoPair": 2,
+            "PocketPairOverPairPlusLowerPairedBoard": 2,
+            "PocketPairPlusHigherPairedBoard": 2,
+            "PocketPairPlusLowerPairedBoard": 2,
+            "TopPairPlusPairedBoard": 2,
+            "SecondPairPlusPairedBoard": 2,
+            "LowPairPlusPairedBoard": 2,
+            "TwoPairsOnBoard": 2,
+            "OverPair": 2,
+            "TopPairTopKicker": 2,
+            "TopPairGoodKicker": 2,
+            # Класс 1: СЛАБЫЕ
+            "TopPairWeakKicker": 1,
+            "SecondPocketPair": 1,
+            "SecondPairAceKicker": 1,
+            "SecondPairNonAceKicker": 1,
+            "LowPocketPair": 1,
+            "BottomPairAceKicker": 1,
+            "BottomPairNonAceKicker": 1,
+            "PairedBoardNoOvercards": 1,
+            "PairedBoardOneOvercard": 1,
+            "PairedBoardTwoOvercards": 1,
+            "TwoCardNutFlushDraw": 1,
+            "TwoCardHighFlushDraw": 1,
+            "OneCardNutFlushDraw": 1,
+            "OneCardHighFlushDraw": 1,
+            # Класс 0: МУСОР
+            "TwoCardLowFlushDraw": 0,
+            "OneCardLowFlushDraw": 0,
+            "TwoCardBackdoorNutFlushDraw": 0,
+            "TwoCardBackdoorFlushDraw": 0,
+            "OneCardBackDoorNutFlushDraw": 0,
+            "OneCardBackDoorFlushDraw": 0,
+            "TwoCardDoubleGutShotStraightDraw": 0,
+            "TwoCardOpenEndedStraightDraw": 0,
+            "OneCardOpenEndedStraightDraw": 0,
+            "TwoCardGutshotStraightDraw": 0,
+            "OneCardGutshotStraightDraw": 0,
+            "TwoCardBackdoorStraightDraw": 0,
+            "OneCardBackdoorStraightDraw": 0,
+            "AceOnBoard": 0,
+            "KingOnBoard": 0,
+            "Other": 0,
+        }
+
+    def parse_card(self, card_str):
+        """Парсит карту из строки"""
+        if not card_str or len(card_str) < 2:
+            return None, None
+        rank = self.RANK_VALUES.get(card_str[0].upper())
+        suit = self.SUIT_MAP.get(card_str[1].lower())
+        return rank, suit
+
+    def evaluate_hand(self, hole_cards, board_cards):
+        """
+        Определяет тип руки из 73 комбинаций
+
+        Args:
+            hole_cards: список из 2 карт игрока ['As', 'Kh']
+            board_cards: список карт на борде ['Qd', 'Js', 'Tc', '9h', '8s']
+
+        Returns:
+            tuple: (hand_type_name, strength_class)
+        """
+        # Парсим карты
+        hole = [self.parse_card(c) for c in hole_cards if c]
+        board = [self.parse_card(c) for c in board_cards if c]
+
+        # Убираем None значения
+        hole = [(r, s) for r, s in hole if r is not None]
+        board = [(r, s) for r, s in board if r is not None]
+
+        if len(hole) != 2:
+            return "Other", 0
+
+        # Все карты вместе
+        all_cards = hole + board
+
+        # Проверяем комбинации в порядке убывания силы
+
+        # 1. Стрит-флеш
+        sf_type = self._check_straight_flush(hole, board, all_cards)
+        if sf_type:
+            return sf_type, self.hand_type_to_strength[sf_type]
+
+        # 2. Каре
+        quads_type = self._check_four_of_kind(hole, board, all_cards)
+        if quads_type:
+            return quads_type, self.hand_type_to_strength[quads_type]
+
+        # 3. Фулл-хаус
+        fh_type = self._check_full_house(hole, board, all_cards)
+        if fh_type:
+            return fh_type, self.hand_type_to_strength[fh_type]
+
+        # 4. Флеш
+        flush_type = self._check_flush(hole, board, all_cards)
+        if flush_type:
+            return flush_type, self.hand_type_to_strength[flush_type]
+
+        # 5. Стрит
+        straight_type = self._check_straight(hole, board, all_cards)
+        if straight_type:
+            return straight_type, self.hand_type_to_strength[straight_type]
+
+        # 6. Сет/Трипс
+        trips_type = self._check_three_of_kind(hole, board, all_cards)
+        if trips_type:
+            return trips_type, self.hand_type_to_strength[trips_type]
+
+        # 7. Две пары
+        two_pair_type = self._check_two_pair(hole, board, all_cards)
+        if two_pair_type:
+            return two_pair_type, self.hand_type_to_strength[two_pair_type]
+
+        # 8. Одна пара
+        pair_type = self._check_one_pair(hole, board, all_cards)
+        if pair_type:
+            return pair_type, self.hand_type_to_strength[pair_type]
+
+        # 9. Дро
+        draw_type = self._check_draws(hole, board)
+        if draw_type:
+            return draw_type, self.hand_type_to_strength[draw_type]
+
+        # 10. Высокие карты
+        high_card_type = self._check_high_cards(board)
+        if high_card_type:
+            return high_card_type, self.hand_type_to_strength[high_card_type]
+
+        return "Other", 0
+
+    def _check_straight_flush(self, hole, board, all_cards):
+        """Проверяет стрит-флеш"""
+        # Группируем по мастям
+        suits = {}
+        for rank, suit in all_cards:
+            if suit not in suits:
+                suits[suit] = []
+            suits[suit].append(rank)
+
+        # Проверяем каждую масть
+        for suit, ranks in suits.items():
+            if len(ranks) >= 5:
+                # Проверяем стрит в этой масти
+                if self._is_straight_in_ranks(sorted(ranks, reverse=True)):
+                    # Считаем сколько карт из hole cards участвуют
+                    hole_in_sf = sum(1 for r, s in hole if s == suit and r in ranks[:5])
+                    if hole_in_sf == 2:
+                        return "TwoCardStraightFlush"
+                    elif hole_in_sf == 1:
+                        return "OneCardStraightFlush"
+        return None
+
+    def _check_four_of_kind(self, hole, board, all_cards):
+        """Проверяет каре"""
+        rank_counts = Counter(r for r, s in all_cards)
+
+        for rank, count in rank_counts.items():
+            if count == 4:
+                hole_ranks = [r for r, s in hole]
+                board_ranks = [r for r, s in board]
+
+                # Каре на борде
+                if board_ranks.count(rank) == 4:
+                    return "FourOfAKindOnBoard"
+                # Карманная пара
+                elif hole_ranks[0] == hole_ranks[1] == rank:
+                    return "FourOfAKindWithPocketPair"
+                else:
+                    return "FourOfAKindWithoutPocketPair"
+        return None
+
+    def _check_full_house(self, hole, board, all_cards):
+        """Проверяет фулл-хаус"""
+        rank_counts = Counter(r for r, s in all_cards)
+        trips = [r for r, c in rank_counts.items() if c >= 3]
+        pairs = [r for r, c in rank_counts.items() if c >= 2]
+
+        if trips and len(pairs) >= 2:
+            hole_ranks = [r for r, s in hole]
+            board_ranks = [r for r, s in board]
+
+            # Проверяем разные типы фулл-хаусов
+            if hole_ranks[0] == hole_ranks[1]:  # Карманная пара
+                if board_ranks.count(trips[0]) == 3:  # Трипс на борде
+                    return "FullHouseWithPocketPairTripsOnBoard"
+                else:
+                    return "FullHouseWithPocketPairNoTripsOnBoard"
+            elif board_ranks.count(trips[0]) == 3:  # Трипс на борде
+                return "OneCardFullHouseTripsOnBoard"
+            elif max(hole_ranks) in trips and max(board_ranks) == max(hole_ranks):
+                return "OneCardFullHouseTopPair"
+            else:
+                return "TwoCardFullHouseWithoutPocketPair"
+        return None
+
+    def _check_flush(self, hole, board, all_cards):
+        """Проверяет флеш"""
+        suit_counts = Counter(s for r, s in all_cards)
+
+        for suit, count in suit_counts.items():
+            if count >= 5:
+                # Карты этой масти
+                suited_cards = sorted(
+                    [r for r, s in all_cards if s == suit], reverse=True
+                )
+                hole_suited = [r for r, s in hole if s == suit]
+                board_suited = [r for r, s in board if s == suit]
+
+                # Определяем силу флеша
+                if 14 in hole_suited:  # Туз у игрока
+                    if len(board_suited) == 3:
+                        return "ThreeFlushBoardNutFlush"
+                    else:
+                        return "FourFlushBoardNutFlush"
+                elif max(hole_suited) >= 11:  # K, Q, J
+                    if len(board_suited) == 3:
+                        return "ThreeFlushBoardHighFlush"
+                    else:
+                        return "FourFlushBoardHighFlush"
+                else:
+                    if len(board_suited) == 3:
+                        return "ThreeFlushBoardLowFlush"
+                    else:
+                        return "FourFlushBoardLowFlush"
+        return None
+
+    def _check_straight(self, hole, board, all_cards):
+        """Проверяет стрит"""
+        ranks = sorted(set(r for r, s in all_cards), reverse=True)
+
+        # Проверяем колесо (A-2-3-4-5)
+        if set([14, 2, 3, 4, 5]).issubset(ranks):
+            ranks.append(1)  # Туз как единица
+
+        # Ищем стрит
+        for i in range(len(ranks) - 4):
+            if ranks[i] - ranks[i + 4] == 4:
+                straight_ranks = ranks[i : i + 5]
+                hole_ranks = [r for r, s in hole]
+
+                # Считаем карты игрока в стрите
+                hole_in_straight = sum(1 for r in hole_ranks if r in straight_ranks)
+
+                # Проверяем натсовость
+                is_nut = straight_ranks[0] == max(ranks) or (
+                    14 in straight_ranks and 13 in straight_ranks
+                )
+
+                if hole_in_straight == 2:
+                    return "TwoCardNutStraight" if is_nut else "TwoCardStraight"
+                elif hole_in_straight == 1:
+                    return "OneCardNutStraight" if is_nut else "OneCardStraight"
+        return None
+
+    def _check_three_of_kind(self, hole, board, all_cards):
+        """Проверяет сет/трипс"""
+        rank_counts = Counter(r for r, s in all_cards)
+
+        for rank, count in rank_counts.items():
+            if count == 3:
+                hole_ranks = [r for r, s in hole]
+                board_ranks = sorted([r for r, s in board], reverse=True)
+
+                # Трипс на борде
+                if board_ranks.count(rank) == 3:
+                    return "TripsOnBoard"
+
+                # Сет (карманная пара)
+                if hole_ranks[0] == hole_ranks[1] == rank:
+                    board_higher = [r for r in board_ranks if r > rank]
+                    if len(board_higher) == 0:
+                        return "HighSet"
+                    elif len(board_higher) == 1:
+                        return "SecondSet"
+                    else:
+                        return "LowSet"
+
+                # Трипс (одна карта в руке)
+                else:
+                    kicker = max(r for r in hole_ranks if r != rank)
+                    board_higher = [r for r in board_ranks if r > rank]
+
+                    if len(board_higher) == 0:  # Топ трипс
+                        return (
+                            "HighTripsHighKicker"
+                            if kicker >= 12
+                            else "HighTripsLowKicker"
+                        )
+                    elif len(board_higher) == 1:  # Средний трипс
+                        return (
+                            "SecondTripsHighKicker"
+                            if kicker >= 12
+                            else "SecondTripsLowKicker"
+                        )
+                    else:  # Младший трипс
+                        return (
+                            "LowTripsHighKicker"
+                            if kicker >= 12
+                            else "LowTripsLowKicker"
+                        )
+        return None
+
+    def _check_two_pair(self, hole, board, all_cards):
+        """Проверяет две пары"""
+        rank_counts = Counter(r for r, s in all_cards)
+        pairs = sorted([r for r, c in rank_counts.items() if c >= 2], reverse=True)
+
+        if len(pairs) >= 2:
+            hole_ranks = [r for r, s in hole]
+            board_ranks = sorted([r for r, s in board], reverse=True)
+
+            top_board = board_ranks[0] if board_ranks else 0
+
+            # Обе карты игрока спарены
+            if (
+                hole_ranks[0] in pairs
+                and hole_ranks[1] in pairs
+                and hole_ranks[0] != hole_ranks[1]
+            ):
+                if hole_ranks[0] == top_board and hole_ranks[1] == board_ranks[1]:
+                    return "TopTwoPair"
+                elif max(hole_ranks) == top_board:
+                    return "TopPairPlusPair"
+                else:
+                    return "NonTopTwoPair"
+
+            # Карманная пара
+            elif hole_ranks[0] == hole_ranks[1] and hole_ranks[0] in pairs:
+                board_pairs = [r for r in board_ranks if rank_counts[r] >= 2]
+                if board_pairs:
+                    if hole_ranks[0] > board_pairs[0]:
+                        return "PocketPairOverPairPlusLowerPairedBoard"
+                    elif hole_ranks[0] > min(board_pairs):
+                        return "PocketPairPlusHigherPairedBoard"
+                    else:
+                        return "PocketPairPlusLowerPairedBoard"
+
+            # Одна пара с игроком + пара на борде
+            elif any(r in pairs for r in hole_ranks):
+                player_pair = next(r for r in hole_ranks if r in pairs)
+                if player_pair == top_board:
+                    return "TopPairPlusPairedBoard"
+                elif board_ranks.index(player_pair) == 1:
+                    return "SecondPairPlusPairedBoard"
+                else:
+                    return "LowPairPlusPairedBoard"
+
+            # Две пары на борде
+            else:
+                return "TwoPairsOnBoard"
+        return None
+
+    def _check_one_pair(self, hole, board, all_cards):
+        """Проверяет одну пару"""
+        rank_counts = Counter(r for r, s in all_cards)
+        pairs = [r for r, c in rank_counts.items() if c == 2]
+
+        if pairs:
+            hole_ranks = sorted([r for r, s in hole], reverse=True)
+            board_ranks = sorted([r for r, s in board], reverse=True)
+            pair_rank = max(pairs)
+
+            # Карманная пара
+            if hole_ranks[0] == hole_ranks[1] == pair_rank:
+                if not board_ranks or pair_rank > max(board_ranks):
+                    return "OverPair"
+                elif pair_rank in board_ranks:
+                    board_position = board_ranks.index(pair_rank)
+                    if board_position == 1:
+                        return "SecondPocketPair"
+                    else:
+                        return "LowPocketPair"
+                else:
+                    return "LowPocketPair"
+
+            # Пара с бордом
+            elif pair_rank in hole_ranks:
+                kicker = max(r for r in hole_ranks if r != pair_rank)
+
+                # Проверяем, есть ли pair_rank в board_ranks перед использованием index()
+                if pair_rank in board_ranks:
+                    board_position = board_ranks.index(pair_rank)
+
+                    if board_position == 0:  # Топ пара
+                        if kicker == 14:
+                            return "TopPairTopKicker"
+                        elif kicker >= 11:
+                            return "TopPairGoodKicker"
+                        else:
+                            return "TopPairWeakKicker"
+                    elif board_position == 1:  # Средняя пара
+                        return (
+                            "SecondPairAceKicker"
+                            if kicker == 14
+                            else "SecondPairNonAceKicker"
+                        )
+                    else:  # Младшая пара
+                        return (
+                            "BottomPairAceKicker"
+                            if kicker == 14
+                            else "BottomPairNonAceKicker"
+                        )
+                else:
+                    # Если pair_rank нет в board_ranks, это может быть карманная пара
+                    return "LowPocketPair"
+
+            # Пара на борде
+            else:
+                if board_ranks:
+                    overcards = sum(1 for r in hole_ranks if r > max(board_ranks))
+                    if overcards == 0:
+                        return "PairedBoardNoOvercards"
+                    elif overcards == 1:
+                        return "PairedBoardOneOvercard"
+                    else:
+                        return "PairedBoardTwoOvercards"
+                else:
+                    return "PairedBoardTwoOvercards"
+
+        return None
+
+    def _check_draws(self, hole, board):
+        """Проверяет дро"""
+        if len(board) < 5:  # Только на флопе и терне есть дро
+            # Флеш-дро
+            flush_draw = self._check_flush_draw(hole, board)
+            if flush_draw:
+                return flush_draw
+
+            # Стрит-дро
+            straight_draw = self._check_straight_draw(hole, board)
+            if straight_draw:
+                return straight_draw
+        return None
+
+    def _check_flush_draw(self, hole, board):
+        """Проверяет флеш-дро"""
+        all_cards = hole + board
+        suit_counts = Counter(s for r, s in all_cards)
+
+        for suit, count in suit_counts.items():
+            if count == 4:  # Флеш-дро
+                hole_suited = [r for r, s in hole if s == suit]
+                if len(hole_suited) == 2:
+                    if 14 in hole_suited:
+                        return "TwoCardNutFlushDraw"
+                    elif max(hole_suited) >= 11:
+                        return "TwoCardHighFlushDraw"
+                    else:
+                        return "TwoCardLowFlushDraw"
+                elif len(hole_suited) == 1:
+                    if hole_suited[0] == 14:
+                        return "OneCardNutFlushDraw"
+                    elif hole_suited[0] >= 11:
+                        return "OneCardHighFlushDraw"
+                    else:
+                        return "OneCardLowFlushDraw"
+            elif count == 3 and len(board) == 3:  # Бэкдорное флеш-дро
+                hole_suited = [r for r, s in hole if s == suit]
+                if len(hole_suited) == 2:
+                    if 14 in hole_suited:
+                        return "TwoCardBackdoorNutFlushDraw"
+                    else:
+                        return "TwoCardBackdoorFlushDraw"
+                elif len(hole_suited) == 1:
+                    if hole_suited[0] == 14:
+                        return "OneCardBackDoorNutFlushDraw"
+                    else:
+                        return "OneCardBackDoorFlushDraw"
+        return None
+
+    def _check_straight_draw(self, hole, board):
+        """Проверяет стрит-дро"""
+        all_ranks = sorted(set(r for r, s in hole + board), reverse=True)
+        hole_ranks = [r for r, s in hole]
+
+        # OESD и гатшоты
+        outs = 0
+        draw_type = None
+
+        for target in range(14, 4, -1):
+            straight_cards = list(range(target - 4, target + 1))
+            have = sum(1 for r in straight_cards if r in all_ranks)
+            hole_in = sum(1 for r in straight_cards if r in hole_ranks)
+
+            if have == 4 and hole_in >= 1:
+                missing = [r for r in straight_cards if r not in all_ranks][0]
+                if missing == straight_cards[0] or missing == straight_cards[4]:
+                    # OESD
+                    if hole_in == 2:
+                        return "TwoCardOpenEndedStraightDraw"
+                    else:
+                        return "OneCardOpenEndedStraightDraw"
+                else:
+                    # Гатшот
+                    if hole_in == 2:
+                        draw_type = "TwoCardGutshotStraightDraw"
+                    else:
+                        draw_type = "OneCardGutshotStraightDraw"
+                    outs += 4
+
+        if outs >= 8:
+            return "TwoCardDoubleGutShotStraightDraw"
+        elif draw_type:
+            return draw_type
+
+        # Бэкдорное стрит-дро (только на флопе)
+        if len(board) == 3:
+            for target in range(14, 4, -1):
+                straight_cards = list(range(target - 4, target + 1))
+                have = sum(1 for r in straight_cards if r in all_ranks)
+                hole_in = sum(1 for r in straight_cards if r in hole_ranks)
+
+                if have == 3 and hole_in >= 1:
+                    if hole_in == 2:
+                        return "TwoCardBackdoorStraightDraw"
+                    else:
+                        return "OneCardBackdoorStraightDraw"
+
+        return None
+
+    def _check_high_cards(self, board):
+        """Проверяет высокие карты на борде"""
+        board_ranks = [r for r, s in board]
+        if 14 in board_ranks:
+            return "AceOnBoard"
+        elif 13 in board_ranks:
+            return "KingOnBoard"
+        return None
+
+    def _is_straight_in_ranks(self, ranks):
+        """Проверяет есть ли стрит в списке рангов"""
+        ranks = sorted(set(ranks), reverse=True)
+
+        # Проверяем обычные стриты
+        for i in range(len(ranks) - 4):
+            if ranks[i] - ranks[i + 4] == 4:
+                return True
+
+        # Проверяем колесо (A-5)
+        if set([14, 2, 3, 4, 5]).issubset(ranks):
+            return True
+
+        return False
+
+
+# Функция для добавления в препроцессинг данных
+def add_hand_evaluation_to_dataframe(df):
+    """
+    Добавляет оценку типа руки и силы к DataFrame
+
+    Args:
+        df: DataFrame с колонками Showdown_1, Showdown_2, Card1-Card5
+
+    Returns:
+        df: DataFrame с добавленными колонками hand_type_hm3 и hand_strength_class
+    """
+    evaluator = PokerHandEvaluator()
+
+    hand_types = []
+    strength_classes = []
+
+    for idx, row in df.iterrows():
+        # Карты игрока
+        hole_cards = [row.get("Showdown_1"), row.get("Showdown_2")]
+
+        # Карты борда
+        board_cards = []
+        for i in range(1, 6):
+            card = row.get(f"Card{i}")
+            if pd.notna(card) and card:
+                board_cards.append(card)
+
+        # Оцениваем руку
+        if all(pd.notna(c) for c in hole_cards):
+            hand_type, strength_class = evaluator.evaluate_hand(hole_cards, board_cards)
+        else:
+            hand_type, strength_class = "Other", 0
+
+        hand_types.append(hand_type)
+        strength_classes.append(strength_class)
+
+    df["hand_type_hm3"] = hand_types
+    df["hand_strength_class"] = strength_classes
+
+    # Статистика
+    print(f"\n📊 Распределение типов рук:")
+    type_counts = df["hand_type_hm3"].value_counts()
+    for hand_type, count in type_counts.head(20).items():
+        strength = evaluator.hand_type_to_strength.get(hand_type, 0)
+        print(
+            f"   {hand_type:40s}: {count:5d} ({count/len(df)*100:5.1f}%) - Сила: {strength}"
+        )
+
+    print(f"\n📊 Распределение классов силы:")
+    strength_dist = df["hand_strength_class"].value_counts().sort_index()
+    class_names = ["Мусор/Дро", "Слабые", "Средние", "Сильные", "Монстры"]
+    for strength, count in strength_dist.items():
+        print(
+            f"   Класс {strength} ({class_names[strength]}): {count:5d} ({count/len(df)*100:5.1f}%)"
+        )
+
+    return df
+
+
 # ---------------------- 1. Модель RWKV ----------------------
 
 
 class SequenceHandRangeRWKV(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers=3, max_sequence_length=20):
-        super(SequenceHandRangeRWKV, self).__init__()
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        num_layers=3,
+        max_sequence_length=20,
+        num_strength_classes=5,
+        num_categories=73,
+    ):
+        super(
+            SequenceHandRangeRWKV, self
+        ).__init__()  # Правильный вызов родительского конструктора
 
+        # Сохраняем параметры
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
+        self.num_strength_classes = num_strength_classes
+        self.num_categories = num_categories
 
+        # Создаем слои
         self.embedding = nn.Linear(input_dim, hidden_dim)
         self.rwkv_layers = nn.ModuleList(
             [RWKV_Block(hidden_dim) for _ in range(num_layers)]
@@ -40,8 +748,8 @@ class SequenceHandRangeRWKV(nn.Module):
         self.dropout = nn.Dropout(0.3)
 
         # Выходные слои для разных предсказаний
-        self.hand_strength_head = nn.Linear(hidden_dim, 10)  # 10 уровней силы руки
-        self.category_head = nn.Linear(hidden_dim, 9)  # 9 категорий рук
+        self.hand_strength_head = nn.Linear(hidden_dim, num_strength_classes)
+        self.category_head = nn.Linear(hidden_dim, num_categories)
         self.specific_hand_head = nn.Linear(hidden_dim, 13)  # 13 рангов карт
 
         # Sigmoid только для specific_hand
@@ -558,38 +1266,56 @@ class HandRangeDataset(Dataset):
             return self.features[idx]
 
 
-def create_target_variables(df):
-    """Создание всех целевых переменных на основе РЕАЛЬНЫХ карт"""
+def create_target_variables(df, use_hm3_classification=True):
+    """Создание целевых переменных с поддержкой HM3 классификации"""
     n_samples = len(df)
+
+    if use_hm3_classification:
+        # Для HM3: 5 классов силы
+        num_strength_classes = 5
+
+        # Получаем уникальные типы рук для категорий
+        unique_hand_types = df["hand_type_hm3"].unique()
+        category_mapping = {ht: i for i, ht in enumerate(sorted(unique_hand_types))}
+        num_categories = len(unique_hand_types)
+
+        print(f"📊 HM3 классификация:")
+        print(f"   Классов силы: {num_strength_classes}")
+        print(f"   Типов рук: {num_categories}")
+
+    else:
+        # Старая система
+        num_strength_classes = 10
+        category_mapping = PokerHandAnalyzer.get_category_mapping()
+        num_categories = 9
 
     # Целевые переменные
     targets = {
         "hand_strength": df["hand_strength"].values.astype(int),
-        "category_probs": np.zeros((n_samples, 9)),  # 9 категорий
-        "specific_hand": np.zeros((n_samples, 13)),  # 13 рангов
+        "category_probs": np.zeros((n_samples, num_categories)),
+        "specific_hand": np.zeros((n_samples, 13)),  # Ранги карт
     }
 
-    # Кодирование категорий в one-hot
-    category_mapping = PokerHandAnalyzer.get_category_mapping()
+    # Кодирование категорий
+    for i, row in df.iterrows():
+        if use_hm3_classification:
+            cat_idx = category_mapping.get(row["hand_type_hm3"], 0)
+        else:
+            cat_idx = category_mapping.get(row["hand_category"], 8)
 
-    for i, category in enumerate(df["hand_category"]):
-        cat_idx = category_mapping.get(category, 8)  # 8 = other
         targets["category_probs"][i, cat_idx] = 1.0
 
-    # Для specific_hand используем реальные карты игрока
-    analyzer = PokerHandAnalyzer()
-
-    for i, (_, row) in enumerate(df.iterrows()):
+        # Specific hand (ранги карт игрока)
+        analyzer = PokerHandAnalyzer()
         try:
             card1 = row["Showdown_1"]
             card2 = row["Showdown_2"]
 
             if pd.notna(card1) and pd.notna(card2):
-                rank1, suit1 = analyzer.parse_card(card1)
-                rank2, suit2 = analyzer.parse_card(card2)
+                rank1, _ = analyzer.parse_card(card1)
+                rank2, _ = analyzer.parse_card(card2)
 
                 if rank1 is not None and rank2 is not None:
-                    # Преобразуем ранги в индексы (A=14 -> 12, K=13 -> 11, ..., 2=2 -> 0)
                     rank1_idx = max(0, min(12, rank1 - 2))
                     rank2_idx = max(0, min(12, rank2 - 2))
 
@@ -602,11 +1328,10 @@ def create_target_variables(df):
                             neighbor_idx = rank_idx + offset
                             if 0 <= neighbor_idx < 13:
                                 targets["specific_hand"][i, neighbor_idx] = 0.1
-        except Exception as e:
-            # В случае ошибки, равномерное распределение
+        except Exception:
             targets["specific_hand"][i, :] = 1 / 13
 
-    # Нормализуем specific_hand чтобы сумма была 1
+    # Нормализуем specific_hand
     for i in range(n_samples):
         row_sum = targets["specific_hand"][i, :].sum()
         if row_sum > 0:
@@ -1896,20 +2621,15 @@ def create_player_sequences(df, max_sequence_length=20, min_sequence_length=3):
     return sequences, sequence_info
 
 
-def prepare_sequence_hand_range_data(
+def prepare_sequence_hand_range_data_with_hm3(
     file_path,
     include_hole_cards=True,
     max_sequence_length="auto",
     balance_strategy="adaptive",
+    use_hm3_classification=True,  # Новый параметр
 ):
     """
-    Подготовка данных с автоматическим определением длины последовательностей
-
-    Args:
-        file_path: путь к файлу или DataFrame
-        include_hole_cards: включать ли карты игрока
-        max_sequence_length: 'auto' для автоматического определения или число
-        balance_strategy: стратегия создания последовательностей
+    Подготовка данных с HM3 классификацией рук
     """
     print(f"🎯 === ПОДГОТОВКА ДАННЫХ С ПОСЛЕДОВАТЕЛЬНОСТЯМИ ===")
 
@@ -1931,6 +2651,27 @@ def prepare_sequence_hand_range_data(
         print("❌ Нет записей с открытыми картами!")
         return None
 
+    # НОВОЕ: Добавляем HM3 классификацию
+    if use_hm3_classification:
+        print("🃏 Анализ рук по системе HM3 (73 типа)...")
+        df_filtered = add_hand_evaluation_to_dataframe(df_filtered)
+
+        # Используем HM3 классификацию вместо старой
+        df_filtered["hand_strength"] = df_filtered["hand_strength_class"]
+        df_filtered["hand_category"] = df_filtered["hand_type_hm3"]
+    else:
+        # Старая система (префлоп сила)
+        print("🔍 Анализ силы рук (старая система)...")
+        analyzer = PokerHandAnalyzer()
+        hand_analysis = df_filtered.apply(
+            lambda row: analyzer.analyze_hand_strength(
+                row["Showdown_1"], row["Showdown_2"]
+            ),
+            axis=1,
+        )
+        df_filtered["hand_strength"] = [x[0] for x in hand_analysis]
+        df_filtered["hand_category"] = [x[1] for x in hand_analysis]
+
     # Стандартизация названий колонок
     column_mapping = {
         "PlayerId": "PlayerID",
@@ -1950,15 +2691,30 @@ def prepare_sequence_hand_range_data(
             + "_"
             + df_filtered.get("TournamentNumber", df_filtered.index // 100).astype(str)
         )
-        print("🆔 Создана колонка PlayerID")
 
     if "Timestamp" not in df_filtered.columns:
         df_filtered["Timestamp"] = df_filtered.get("Round", df_filtered.index)
-        print("⏰ Создана колонка Timestamp")
 
     if "HandID" not in df_filtered.columns:
         df_filtered["HandID"] = df_filtered.get("Hand", df_filtered.index // 10)
-        print("🃏 Создана колонка HandID")
+
+    print(f"✅ Анализ завершен. Распределение силы рук:")
+    strength_dist = df_filtered["hand_strength"].value_counts().sort_index()
+
+    if use_hm3_classification:
+        class_names = ["Мусор/Дро", "Слабые", "Средние", "Сильные", "Монстры"]
+        for strength, count in strength_dist.items():
+            name = (
+                class_names[strength]
+                if strength < len(class_names)
+                else f"Класс {strength}"
+            )
+            print(f"   {name}: {count} рук ({count/len(df_filtered)*100:.1f}%)")
+    else:
+        for strength, count in strength_dist.items():
+            print(
+                f"   Сила {strength}: {count} рук ({count/len(df_filtered)*100:.1f}%)"
+            )
 
     # Анализ рук и создание целевых переменных
     print("🔍 Анализ силы рук...")
@@ -3469,7 +4225,8 @@ def main():
             f"results/comparison_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         )
         with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(comparison_report, f, indent=2, ensure_ascii=False)
+            comparison_report_safe = safe_json_serialize(comparison_report)
+            json.dump(comparison_report_safe, f, indent=2, ensure_ascii=False)
 
         print(f"   📋 Отчет сохранен: {report_path}")
 
@@ -3776,8 +4533,11 @@ def main_with_sequences():
 
     try:
         print(f"📥 Подготовка данных с картами игрока...")
-        data_with_cards = prepare_sequence_hand_range_data(
-            data_path, include_hole_cards=True, max_sequence_length=max_sequence_length
+        data_with_cards = prepare_sequence_hand_range_data_with_hm3(
+            data_path,
+            include_hole_cards=True,
+            max_sequence_length=max_sequence_length,
+            use_hm3_classification=True,  # Включаем HM3!
         )
 
         if data_with_cards is not None:
@@ -3831,7 +4591,7 @@ def main_with_sequences():
 
     try:
         print(f"📥 Подготовка данных без карт игрока...")
-        data_without_cards = prepare_sequence_hand_range_data(
+        data_without_cards = prepare_sequence_hand_range_data_with_hm3(
             data_path, include_hole_cards=False, max_sequence_length=max_sequence_length
         )
 
@@ -3977,7 +4737,8 @@ def main_with_sequences():
 
         report_path = f"results/sequence_comparison_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         with open(report_path, "w", encoding="utf-8") as f:
-            json.dump(comparison_report, f, indent=2, ensure_ascii=False)
+            final_report_safe = safe_json_serialize(final_report)
+            json.dump(final_report_safe, f, indent=2, ensure_ascii=False)
 
         print(f"📋 Детальный отчет сохранен: {report_path}")
 
@@ -4114,7 +4875,7 @@ def process_all_files_with_sequences():
         print(f"{'='*80}")
 
         try:
-            data_dict = prepare_sequence_hand_range_data(
+            data_dict = prepare_sequence_hand_range_data_with_hm3(
                 combined_filename,
                 include_hole_cards=include_cards,
                 max_sequence_length=max_sequence_length,
