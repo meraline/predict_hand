@@ -22,6 +22,239 @@ from datetime import datetime
 
 
 # ---------------------- 1. Модель RWKV ----------------------
+
+
+class SequenceHandRangeRWKV(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers=3, max_sequence_length=20):
+        super(SequenceHandRangeRWKV, self).__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.max_sequence_length = max_sequence_length
+
+        self.embedding = nn.Linear(input_dim, hidden_dim)
+        self.rwkv_layers = nn.ModuleList(
+            [RWKV_Block(hidden_dim) for _ in range(num_layers)]
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(0.3)
+
+        # Выходные слои для разных предсказаний
+        self.hand_strength_head = nn.Linear(hidden_dim, 10)  # 10 уровней силы руки
+        self.category_head = nn.Linear(hidden_dim, 9)  # 9 категорий рук
+        self.specific_hand_head = nn.Linear(hidden_dim, 13)  # 13 рангов карт
+
+        # Sigmoid только для specific_hand
+        self.sigmoid = nn.Sigmoid()
+
+    def reset_states(self):
+        """Сброс состояния всех RWKV слоев"""
+        for layer in self.rwkv_layers:
+            layer.reset_state()
+
+    def forward(self, x, return_all_timesteps=False):
+        """
+        x: [batch_size, sequence_length, input_dim]
+        return_all_timesteps: если True, возвращает предсказания для всех временных шагов
+        """
+        batch_size, seq_len, _ = x.size()
+
+        # Применяем embedding
+        x = self.embedding(x)  # [batch_size, seq_len, hidden_dim]
+
+        # Проходим через RWKV слои
+        for layer in self.rwkv_layers:
+            residual = x
+            x = layer(x)
+            x = residual + x
+            x = self.norm(x)
+            x = self.dropout(x)
+
+        # Если нужны все временные шаги
+        if return_all_timesteps:
+            # Предсказания для каждого временного шага
+            all_predictions = []
+            for t in range(seq_len):
+                xt = x[:, t, :]  # [batch_size, hidden_dim]
+
+                hand_strength = self.hand_strength_head(xt)
+                category_logits = self.category_head(xt)
+                specific_hand = self.sigmoid(self.specific_hand_head(xt))
+
+                all_predictions.append(
+                    {
+                        "hand_strength": hand_strength,
+                        "category_probs": category_logits,
+                        "specific_hand": specific_hand,
+                    }
+                )
+            return all_predictions
+        else:
+            # Берем только последний временной шаг для предсказания
+            x = x[:, -1, :]  # [batch_size, hidden_dim]
+
+            # Многозадачный выход
+            hand_strength = self.hand_strength_head(x)
+            category_logits = self.category_head(x)
+            specific_hand = self.sigmoid(self.specific_hand_head(x))
+
+            return {
+                "hand_strength": hand_strength,
+                "category_probs": category_logits,
+                "specific_hand": specific_hand,
+            }
+
+
+class SequenceHandRangeDataset(Dataset):
+    def __init__(self, sequences, feature_columns, targets=None, max_length=20):
+        """
+        sequences: список DataFrame'ов, каждый - последовательность действий игрока
+        feature_columns: список названий колонок с признаками
+        targets: словарь с целевыми переменными для каждой последовательности
+        max_length: максимальная длина последовательности (для padding)
+        """
+        self.sequences = sequences
+        self.feature_columns = feature_columns
+        self.max_length = max_length
+        self.has_targets = targets is not None
+
+        if self.has_targets:
+            self.targets = targets
+
+        # Предварительная обработка всех последовательностей
+        self.processed_sequences = []
+        self.valid_indices = []
+
+        for idx, seq_df in enumerate(sequences):
+            try:
+                # Извлекаем признаки
+                features = seq_df[feature_columns].values.astype(np.float32)
+
+                # Проверяем на валидность
+                if not np.any(np.isnan(features)) and len(features) > 0:
+                    self.processed_sequences.append(features)
+                    self.valid_indices.append(idx)
+
+            except Exception as e:
+                # Пропускаем проблемные последовательности
+                continue
+
+        print(
+            f"📊 Dataset создан: {len(self.valid_indices)} валидных последовательностей из {len(sequences)}"
+        )
+
+    def __len__(self):
+        return len(self.valid_indices)
+
+    def __getitem__(self, idx):
+        actual_idx = self.valid_indices[idx]
+        features = self.processed_sequences[idx]
+
+        # Padding/truncation до max_length
+        seq_len = min(len(features), self.max_length)
+
+        # Создаем тензор с padding
+        padded_features = np.zeros(
+            (self.max_length, len(self.feature_columns)), dtype=np.float32
+        )
+        padded_features[:seq_len] = features[:seq_len]
+
+        features_tensor = torch.tensor(padded_features, dtype=torch.float32)
+
+        if self.has_targets:
+            # Целевые переменные только для последнего элемента последовательности
+            target_dict = {
+                "hand_strength": torch.tensor(
+                    self.targets["hand_strength"][actual_idx], dtype=torch.long
+                ),
+                "category_probs": torch.tensor(
+                    self.targets["category_probs"][actual_idx], dtype=torch.float32
+                ),
+                "specific_hand": torch.tensor(
+                    self.targets["specific_hand"][actual_idx], dtype=torch.float32
+                ),
+                "sequence_length": torch.tensor(seq_len, dtype=torch.long),
+            }
+            return features_tensor, target_dict
+        else:
+            return features_tensor, torch.tensor(seq_len, dtype=torch.long)
+
+
+def create_sequences_with_targets(df, feature_columns, max_sequence_length=20):
+    """
+    Создает последовательности с соответствующими целевыми переменными
+    """
+    print(f"🎯 Создание последовательностей с целевыми переменными...")
+
+    # Создаем последовательности
+    sequences, sequence_info = create_player_sequences(
+        df, max_sequence_length=max_sequence_length
+    )
+
+    # Создаем целевые переменные для каждой последовательности
+    targets = {"hand_strength": [], "category_probs": [], "specific_hand": []}
+
+    valid_sequences = []
+
+    for i, (seq_df, seq_info) in enumerate(zip(sequences, sequence_info)):
+        try:
+            # Берем целевую переменную с последней записи в последовательности
+            last_row = seq_df.iloc[-1]
+
+            if pd.notna(last_row.get("hand_strength")):
+                targets["hand_strength"].append(int(last_row["hand_strength"]))
+
+                # Находим категорию
+                category_idx = 8  # default "other"
+                if pd.notna(last_row.get("hand_category")):
+                    category_mapping = PokerHandAnalyzer.get_category_mapping()
+                    category_idx = category_mapping.get(last_row["hand_category"], 8)
+
+                category_probs = np.zeros(9)
+                category_probs[category_idx] = 1.0
+                targets["category_probs"].append(category_probs)
+
+                # Создаем specific_hand на основе реальных карт
+                specific_hand = np.zeros(13)
+                analyzer = PokerHandAnalyzer()
+
+                card1 = last_row.get("Showdown_1")
+                card2 = last_row.get("Showdown_2")
+
+                if pd.notna(card1) and pd.notna(card2):
+                    rank1, _ = analyzer.parse_card(card1)
+                    rank2, _ = analyzer.parse_card(card2)
+
+                    if rank1 is not None and rank2 is not None:
+                        rank1_idx = max(0, min(12, rank1 - 2))
+                        rank2_idx = max(0, min(12, rank2 - 2))
+                        specific_hand[rank1_idx] = 0.6
+                        specific_hand[rank2_idx] = 0.6
+
+                        # Нормализуем
+                        if specific_hand.sum() > 0:
+                            specific_hand = specific_hand / specific_hand.sum()
+                        else:
+                            specific_hand = np.ones(13) / 13
+                    else:
+                        specific_hand = np.ones(13) / 13
+                else:
+                    specific_hand = np.ones(13) / 13
+
+                targets["specific_hand"].append(specific_hand)
+                valid_sequences.append(seq_df)
+
+        except Exception as e:
+            # Пропускаем проблемные последовательности
+            continue
+
+    print(
+        f"   ✅ Создано {len(valid_sequences)} последовательностей с целевыми переменными"
+    )
+
+    return valid_sequences, targets
+
+
 class RWKV_Block(nn.Module):
     def __init__(self, hidden_dim):
         super(RWKV_Block, self).__init__()
@@ -954,15 +1187,47 @@ def predict_hand_ranges(model, data_dict, sample_hands=5):
 
 
 # ---------------------- 6. Утилиты ----------------------
+
+
+# 4. Дополнительная утилитная функция для безопасной конвертации в JSON
+def convert_to_json_serializable(obj):
+    """Конвертирует numpy/torch типы в стандартные Python типы для JSON"""
+    import numpy as np
+
+    if isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_to_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_json_serializable(item) for item in obj]
+    else:
+        return obj
+
+
+# 5. Обновленная функция setup_directories
 def setup_directories():
     """Создание необходимых папок"""
-    directories = ["models", "plots", "data", "results"]
+    directories = [
+        "models",
+        "plots",
+        "data",
+        "data/combined",  # Подпапка для объединенных файлов
+        "results",
+    ]
     for directory in directories:
         os.makedirs(directory, exist_ok=True)
+    print("📁 Создана структура папок:")
+    for directory in directories:
+        print(f"   ✅ {directory}/")
 
 
+# 2. Функция find_data_files для игнорирования объединенных файлов
 def find_data_files(data_dir="data"):
-    """Поиск CSV файлов с данными"""
+    """Поиск CSV файлов с данными (игнорируя объединенные)"""
     if not os.path.exists(data_dir):
         data_dir = "."  # Текущая папка если нет папки data
 
@@ -972,6 +1237,8 @@ def find_data_files(data_dir="data"):
     data_files = []
     for pattern in patterns:
         files = glob.glob(os.path.join(data_dir, pattern))
+        # Фильтруем объединенные файлы
+        files = [f for f in files if "combined" not in os.path.dirname(f)]
         data_files.extend(files)
 
     # Убираем дубликаты и сортируем
@@ -1013,6 +1280,7 @@ def save_categories_json():
     return categories_info
 
 
+# 6. Обновленная функция choose_data_file для показа правильной структуры
 def choose_data_file():
     """Выбор файла с данными"""
     data_files = find_data_files()
@@ -1020,6 +1288,7 @@ def choose_data_file():
     if not data_files:
         print("❌ CSV файлы с данными не найдены!")
         print("Поместите CSV файл в папку 'data' или в текущую директорию")
+        print("(Объединенные файлы должны быть в data/combined/)")
         return None
 
     if len(data_files) == 1:
@@ -1060,6 +1329,7 @@ def choose_data_file():
             )
 
     print(f"  0. ⭐ ОБЪЕДИНИТЬ ВСЕ {len(data_files)} ФАЙЛОВ И ОБУЧИТЬ МОЩНУЮ МОДЕЛЬ")
+    print(f"\n💡 Объединенные файлы будут сохранены в data/combined/")
 
     while True:
         try:
@@ -1161,11 +1431,16 @@ def combine_all_data_files():
     )
     print(f"   📁 Источников файлов: {len(data_files)}")
 
-    # Сохраняем объединенный файл
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    combined_filename = f"data/combined_poker_data_{timestamp}.csv"
+    # Создаем подпапку для объединенных файлов
+    combined_dir = os.path.join("data", "combined")
+    os.makedirs(combined_dir, exist_ok=True)
 
-    os.makedirs("data", exist_ok=True)
+    # Сохраняем объединенный файл в подпапку
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    combined_filename = os.path.join(
+        combined_dir, f"combined_poker_data_{timestamp}.csv"
+    )
+
     combined_df.to_csv(combined_filename, index=False)
     print(f"💾 Объединенные данные сохранены: {combined_filename}")
 
@@ -1403,6 +1678,1609 @@ def save_best_model(model, data_dict, performance, include_hole_cards):
     return model_path, best_model_path
 
 
+def smart_train_val_test_split(df, test_size=0.15, val_size=0.15, random_state=42):
+    """
+    Комбинированное разделение: по игрокам + временной компонент
+    """
+    print(f"🎯 === УМНОЕ РАЗДЕЛЕНИЕ ДАННЫХ ===")
+
+    # Проверяем наличие нужных колонок
+    required_cols = ["PlayerID", "Timestamp", "HandID"]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+
+    if missing_cols:
+        print(f"⚠️  Отсутствуют колонки: {missing_cols}")
+        print(f"📝 Создаем псевдо-колонки для разделения...")
+
+        # Создаем псевдо PlayerID если его нет
+        if "PlayerID" not in df.columns:
+            # Используем комбинацию файла и места для создания игрока
+            if "source_file" in df.columns and "Seat" in df.columns:
+                df["PlayerID"] = (
+                    df["source_file"].astype(str) + "_seat_" + df["Seat"].astype(str)
+                )
+            else:
+                # В крайнем случае - просто группы строк
+                df["PlayerID"] = (df.index // 50).astype(str)  # группы по 50 записей
+
+        # Создаем псевдо Timestamp если его нет
+        if "Timestamp" not in df.columns:
+            if "Round" in df.columns:
+                df["Timestamp"] = df["Round"]
+            else:
+                df["Timestamp"] = df.index
+
+        # Создаем псевдо HandID если его нет
+        if "HandID" not in df.columns:
+            if "Round" in df.columns:
+                df["HandID"] = df["Round"].astype(str) + "_" + df.index.astype(str)
+            else:
+                df["HandID"] = (df.index // 10).astype(str)  # группы по 10 записей
+
+    # Анализ данных
+    unique_players = df["PlayerID"].unique()
+    total_players = len(unique_players)
+    total_records = len(df)
+
+    print(f"📊 Статистика данных:")
+    print(f"   👥 Уникальных игроков: {total_players:,}")
+    print(f"   📈 Общее количество записей: {total_records:,}")
+    print(f"   📊 Записей на игрока: {total_records/total_players:.1f}")
+
+    # Анализируем распределение записей по игрокам
+    player_counts = df["PlayerID"].value_counts()
+    print(f"   📋 Мин записей у игрока: {player_counts.min()}")
+    print(f"   📋 Макс записей у игрока: {player_counts.max()}")
+    print(f"   📋 Медиана записей: {player_counts.median():.0f}")
+
+    # Фильтруем игроков с минимальным количеством записей
+    min_records_per_player = 5  # минимум для нормального разделения
+    good_players = player_counts[player_counts >= min_records_per_player].index
+
+    if len(good_players) < total_players:
+        filtered_out = total_players - len(good_players)
+        print(
+            f"   🚨 Отфильтровано {filtered_out} игроков с < {min_records_per_player} записей"
+        )
+        df = df[df["PlayerID"].isin(good_players)]
+        unique_players = good_players
+        total_players = len(unique_players)
+
+    print(f"   ✅ Итого игроков для разделения: {total_players}")
+    print(f"   ✅ Итого записей после фильтрации: {len(df):,}")
+
+    # Разделяем игроков на группы
+    np.random.seed(random_state)
+    shuffled_players = np.random.permutation(unique_players)
+
+    # Рассчитываем размеры групп
+    test_players_count = max(1, int(total_players * test_size))
+    val_players_count = max(1, int(total_players * val_size))
+    train_players_count = total_players - test_players_count - val_players_count
+
+    print(f"\n🎯 Разделение игроков:")
+    print(
+        f"   🎓 Train: {train_players_count} игроков ({train_players_count/total_players*100:.1f}%)"
+    )
+    print(
+        f"   🔍 Validation: {val_players_count} игроков ({val_players_count/total_players*100:.1f}%)"
+    )
+    print(
+        f"   🧪 Test: {test_players_count} игроков ({test_players_count/total_players*100:.1f}%)"
+    )
+
+    # Назначаем игроков в группы
+    train_players = shuffled_players[:train_players_count]
+    val_players = shuffled_players[
+        train_players_count : train_players_count + val_players_count
+    ]
+    test_players = shuffled_players[train_players_count + val_players_count :]
+
+    # Собираем данные
+    train_data_list = []
+    val_data_list = []
+    test_data_list = []
+
+    # Для train игроков: ранние записи в train, поздние в validation
+    print(f"\n📅 Временное разделение внутри train игроков...")
+    for player_id in train_players:
+        player_data = df[df["PlayerID"] == player_id].copy()
+        player_data = player_data.sort_values("Timestamp")
+
+        # 80% ранних записей игрока в train, 20% поздних в validation
+        split_idx = max(1, int(len(player_data) * 0.8))
+        train_data_list.append(player_data.iloc[:split_idx])
+
+        if len(player_data) > split_idx:
+            val_data_list.append(player_data.iloc[split_idx:])
+
+    # Для validation игроков: все записи в validation
+    print(f"📝 Добавляем данные validation игроков...")
+    for player_id in val_players:
+        player_data = df[df["PlayerID"] == player_id].copy()
+        val_data_list.append(player_data)
+
+    # Для test игроков: все записи в test
+    print(f"🧪 Добавляем данные test игроков...")
+    for player_id in test_players:
+        player_data = df[df["PlayerID"] == player_id].copy()
+        test_data_list.append(player_data)
+
+    # Объединяем данные
+    train_df = (
+        pd.concat(train_data_list, ignore_index=True)
+        if train_data_list
+        else pd.DataFrame()
+    )
+    val_df = (
+        pd.concat(val_data_list, ignore_index=True) if val_data_list else pd.DataFrame()
+    )
+    test_df = (
+        pd.concat(test_data_list, ignore_index=True)
+        if test_data_list
+        else pd.DataFrame()
+    )
+
+    # Проверяем результат
+    print(f"\n✅ Результаты разделения:")
+    print(f"   🎓 Train: {len(train_df):,} записей ({len(train_df)/len(df)*100:.1f}%)")
+    print(f"   🔍 Validation: {len(val_df):,} записей ({len(val_df)/len(df)*100:.1f}%)")
+    print(f"   🧪 Test: {len(test_df):,} записей ({len(test_df)/len(df)*100:.1f}%)")
+
+    # Проверяем пересечения игроков
+    train_player_set = (
+        set(train_df["PlayerID"].unique()) if len(train_df) > 0 else set()
+    )
+    val_player_set = set(val_df["PlayerID"].unique()) if len(val_df) > 0 else set()
+    test_player_set = set(test_df["PlayerID"].unique()) if len(test_df) > 0 else set()
+
+    train_val_overlap = train_player_set & val_player_set
+    train_test_overlap = train_player_set & test_player_set
+    val_test_overlap = val_player_set & test_player_set
+
+    print(f"\n🔍 Проверка пересечений игроков:")
+    print(f"   Train ∩ Val: {len(train_val_overlap)} игроков (ожидается > 0)")
+    print(f"   Train ∩ Test: {len(train_test_overlap)} игроков (должно быть 0)")
+    print(f"   Val ∩ Test: {len(val_test_overlap)} игроков (должно быть 0)")
+
+    if train_test_overlap or val_test_overlap:
+        print(f"⚠️  ПРЕДУПРЕЖДЕНИЕ: Есть пересечения игроков между train/val и test!")
+    else:
+        print(f"✅ Отлично! Нет утечек между train/val и test выборками")
+
+    return train_df, val_df, test_df
+
+
+def create_player_sequences(df, max_sequence_length=20, min_sequence_length=3):
+    """
+    Создание последовательностей действий игроков для RWKV
+    """
+    print(f"🔄 === СОЗДАНИЕ ПОСЛЕДОВАТЕЛЬНОСТЕЙ ===")
+    print(f"   📏 Максимальная длина последовательности: {max_sequence_length}")
+    print(f"   📏 Минимальная длина последовательности: {min_sequence_length}")
+
+    sequences = []
+    sequence_info = []
+
+    for player_id in df["PlayerID"].unique():
+        player_data = df[df["PlayerID"] == player_id].copy()
+        player_data = player_data.sort_values("Timestamp")
+
+        # Создаем скользящие окна для каждого игрока
+        for start_idx in range(len(player_data)):
+            for end_idx in range(
+                start_idx + min_sequence_length,
+                min(start_idx + max_sequence_length + 1, len(player_data) + 1),
+            ):
+
+                sequence = player_data.iloc[start_idx:end_idx].copy()
+
+                # Добавляем информацию о последовательности
+                sequence_info.append(
+                    {
+                        "player_id": player_id,
+                        "sequence_length": len(sequence),
+                        "start_idx": start_idx,
+                        "end_idx": end_idx,
+                        "start_time": sequence["Timestamp"].iloc[0],
+                        "end_time": sequence["Timestamp"].iloc[-1],
+                    }
+                )
+
+                sequences.append(sequence)
+
+    print(f"   ✅ Создано {len(sequences):,} последовательностей")
+    print(f"   📊 Средняя длина: {np.mean([len(seq) for seq in sequences]):.1f}")
+    print(f"   📊 Игроков: {df['PlayerID'].nunique()}")
+
+    return sequences, sequence_info
+
+
+def prepare_sequence_hand_range_data(
+    file_path,
+    include_hole_cards=True,
+    max_sequence_length="auto",
+    balance_strategy="adaptive",
+):
+    """
+    Подготовка данных с автоматическим определением длины последовательностей
+
+    Args:
+        file_path: путь к файлу или DataFrame
+        include_hole_cards: включать ли карты игрока
+        max_sequence_length: 'auto' для автоматического определения или число
+        balance_strategy: стратегия создания последовательностей
+    """
+    print(f"🎯 === ПОДГОТОВКА ДАННЫХ С ПОСЛЕДОВАТЕЛЬНОСТЯМИ ===")
+
+    # Загрузка данных
+    if isinstance(file_path, str):
+        df = pd.read_csv(file_path)
+    else:
+        df = file_path
+
+    print(f"📊 Загружено {len(df)} строк данных")
+
+    # Фильтрация записей с известными картами
+    mask = (df["Showdown_1"].notna()) & (df["Showdown_2"].notna())
+    df_filtered = df[mask].copy().reset_index(drop=True)
+
+    print(f"🎲 Найдено {len(df_filtered)} записей с открытыми картами")
+
+    if len(df_filtered) == 0:
+        print("❌ Нет записей с открытыми картами!")
+        return None
+
+    # Стандартизация названий колонок
+    column_mapping = {
+        "PlayerId": "PlayerID",
+        "Hand": "HandID",
+        "StartDateUtc": "Timestamp",
+    }
+
+    for old_col, new_col in column_mapping.items():
+        if old_col in df_filtered.columns and new_col not in df_filtered.columns:
+            df_filtered[new_col] = df_filtered[old_col]
+            print(f"🔄 Переименована колонка: {old_col} → {new_col}")
+
+    # Создание недостающих колонок
+    if "PlayerID" not in df_filtered.columns:
+        df_filtered["PlayerID"] = (
+            df_filtered["Seat"].astype(str)
+            + "_"
+            + df_filtered.get("TournamentNumber", df_filtered.index // 100).astype(str)
+        )
+        print("🆔 Создана колонка PlayerID")
+
+    if "Timestamp" not in df_filtered.columns:
+        df_filtered["Timestamp"] = df_filtered.get("Round", df_filtered.index)
+        print("⏰ Создана колонка Timestamp")
+
+    if "HandID" not in df_filtered.columns:
+        df_filtered["HandID"] = df_filtered.get("Hand", df_filtered.index // 10)
+        print("🃏 Создана колонка HandID")
+
+    # Анализ рук и создание целевых переменных
+    print("🔍 Анализ силы рук...")
+    analyzer = PokerHandAnalyzer()
+
+    hand_analysis = df_filtered.apply(
+        lambda row: analyzer.analyze_hand_strength(
+            row["Showdown_1"], row["Showdown_2"]
+        ),
+        axis=1,
+    )
+
+    df_filtered["hand_strength"] = [x[0] for x in hand_analysis]
+    df_filtered["hand_category"] = [x[1] for x in hand_analysis]
+
+    print(f"✅ Анализ завершен. Распределение силы рук:")
+    strength_dist = df_filtered["hand_strength"].value_counts().sort_index()
+    for strength, count in strength_dist.items():
+        print(f"   Сила {strength}: {count} рук ({count/len(df_filtered)*100:.1f}%)")
+
+    # Умное разделение данных
+    print(f"\n🎯 Разделение данных...")
+    train_df, val_df, test_df = smart_train_val_test_split(df_filtered)
+
+    # Подготовка признаков
+    feature_columns = [
+        "Level",
+        "Pot",
+        "Stack",
+        "SPR",
+        "Street_id",
+        "Round",
+        "ActionOrder",
+        "Seat",
+        "Dealer",
+        "Bet",
+        "Allin",
+        "PlayerWins",
+        "WinAmount",
+    ]
+
+    # Добавляем карты стола
+    board_columns = ["Card1", "Card2", "Card3", "Card4", "Card5"]
+    for col in board_columns:
+        if col in df_filtered.columns:
+            df_filtered[f"{col}_rank"], df_filtered[f"{col}_suit"] = zip(
+                *df_filtered[col].apply(
+                    lambda x: analyzer.parse_card(x) if pd.notna(x) else (0, 0)
+                )
+            )
+            feature_columns.extend([f"{col}_rank", f"{col}_suit"])
+
+    # Добавляем карты игрока ТОЛЬКО если нужно
+    if include_hole_cards:
+        print("🃏 Добавляем карты игрока в признаки...")
+        df_filtered["hole1_rank"], df_filtered["hole1_suit"] = zip(
+            *df_filtered["Showdown_1"].apply(
+                lambda x: analyzer.parse_card(x) if pd.notna(x) else (0, 0)
+            )
+        )
+        df_filtered["hole2_rank"], df_filtered["hole2_suit"] = zip(
+            *df_filtered["Showdown_2"].apply(
+                lambda x: analyzer.parse_card(x) if pd.notna(x) else (0, 0)
+            )
+        )
+        feature_columns.extend(["hole1_rank", "hole1_suit", "hole2_rank", "hole2_suit"])
+
+    # Кодирование категориальных переменных
+    encoders = {}
+
+    if "Position" in df_filtered.columns:
+        encoders["position"] = LabelEncoder()
+        df_filtered["Position_encoded"] = encoders["position"].fit_transform(
+            df_filtered["Position"].fillna("Unknown")
+        )
+        feature_columns.append("Position_encoded")
+
+    if "Action" in df_filtered.columns:
+        encoders["action"] = LabelEncoder()
+        df_filtered["Action_encoded"] = encoders["action"].fit_transform(
+            df_filtered["Action"].fillna("Unknown")
+        )
+        feature_columns.append("Action_encoded")
+
+    if "TypeBuyIn" in df_filtered.columns:
+        encoders["buyin"] = LabelEncoder()
+        df_filtered["TypeBuyIn_encoded"] = encoders["buyin"].fit_transform(
+            df_filtered["TypeBuyIn"].fillna("Unknown")
+        )
+        feature_columns.append("TypeBuyIn_encoded")
+
+    # Копируем кодированные признаки в разделенные датафреймы
+    for split_df in [train_df, val_df, test_df]:
+        for col in df_filtered.columns:
+            if (
+                col.endswith("_encoded")
+                or col.endswith("_rank")
+                or col.endswith("_suit")
+            ):
+                split_df[col] = df_filtered.loc[split_df.index, col]
+
+    # Обработка проблемных значений
+    print("🧹 Очистка данных...")
+    for split_df in [train_df, val_df, test_df]:
+        # SPR
+        if "SPR" in split_df.columns:
+            pot_zero_mask = (split_df["Pot"] == 0) | (split_df["Pot"].isnull())
+            split_df.loc[pot_zero_mask, "SPR"] = 100.0
+
+            spr_95th = split_df["SPR"].quantile(0.95)
+            extreme_spr_mask = split_df["SPR"] > spr_95th * 2
+            split_df.loc[extreme_spr_mask, "SPR"] = spr_95th
+
+            spr_median = split_df["SPR"].median()
+            split_df["SPR"] = split_df["SPR"].fillna(spr_median)
+
+        # Остальные колонки
+        for col in feature_columns:
+            if col in split_df.columns:
+                if split_df[col].dtype in ["int64", "float64"]:
+                    split_df[col] = split_df[col].replace([np.inf, -np.inf], np.nan)
+                    median_val = split_df[col].median()
+                    if pd.isna(median_val):
+                        median_val = 0
+                    split_df[col] = split_df[col].fillna(median_val)
+                else:
+                    split_df[col] = split_df[col].fillna(0)
+
+    # Отбор доступных признаков
+    available_features = [col for col in feature_columns if col in train_df.columns]
+    print(f"📋 Используется {len(available_features)} признаков")
+
+    # Нормализация признаков
+    print("📊 Нормализация данных...")
+    scaler = StandardScaler()
+
+    # Обучаем scaler только на train данных
+    scaler.fit(train_df[available_features])
+
+    # Применяем ко всем выборкам
+    train_scaled = pd.DataFrame(
+        scaler.transform(train_df[available_features]),
+        columns=available_features,
+        index=train_df.index,
+    )
+    val_scaled = pd.DataFrame(
+        scaler.transform(val_df[available_features]),
+        columns=available_features,
+        index=val_df.index,
+    )
+    test_scaled = pd.DataFrame(
+        scaler.transform(test_df[available_features]),
+        columns=available_features,
+        index=test_df.index,
+    )
+
+    # Создание последовательностей для каждой выборки
+    print(f"\n🔄 Создание последовательностей...")
+
+    # Автоматическое определение длины последовательности
+    if max_sequence_length == "auto":
+        sequence_params = analyze_optimal_sequence_length(df_filtered)
+        max_sequence_length = sequence_params["max_length"]
+        print(
+            f"\n✅ Автоматически определена максимальная длина: {max_sequence_length}"
+        )
+    else:
+        # Если задано вручную, создаем параметры
+        sequence_params = {
+            "min_length": 3,
+            "recommended_length": min(10, max_sequence_length),
+            "max_length": max_sequence_length,
+        }
+
+    # Создание последовательностей с адаптивными параметрами
+    train_sequences, train_info, _ = create_adaptive_sequences(
+        train_df, sequence_params, balance_strategy
+    )
+
+    # Train последовательности
+    train_sequences, train_seq_info = create_player_sequences(
+        train_df, max_sequence_length=max_sequence_length
+    )
+    train_sequences_with_targets, train_targets = create_sequences_with_targets(
+        train_sequences, available_features, train_scaled
+    )
+
+    # Validation последовательности
+    val_sequences, val_seq_info = create_player_sequences(
+        val_df, max_sequence_length=max_sequence_length
+    )
+    val_sequences_with_targets, val_targets = create_sequences_with_targets(
+        val_sequences, available_features, val_scaled
+    )
+
+    # Test последовательности
+    test_sequences, test_seq_info = create_player_sequences(
+        test_df, max_sequence_length=max_sequence_length
+    )
+    test_sequences_with_targets, test_targets = create_sequences_with_targets(
+        test_sequences, available_features, test_scaled
+    )
+
+    # Создание датасетов
+    print("📦 Создание датасетов...")
+
+    train_dataset = SequenceHandRangeDataset(
+        train_sequences_with_targets,
+        available_features,
+        train_targets,
+        max_sequence_length,
+    )
+    val_dataset = SequenceHandRangeDataset(
+        val_sequences_with_targets, available_features, val_targets, max_sequence_length
+    )
+    test_dataset = SequenceHandRangeDataset(
+        test_sequences_with_targets,
+        available_features,
+        test_targets,
+        max_sequence_length,
+    )
+
+    # DataLoaders
+    batch_size = min(
+        16, max(2, len(train_dataset) // 8)
+    )  # Меньший batch_size для последовательностей
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    print(f"✅ Подготовка данных завершена:")
+    print(f"   🎓 Train: {len(train_dataset)} последовательностей")
+    print(f"   🔍 Validation: {len(val_dataset)} последовательностей")
+    print(f"   🧪 Test: {len(test_dataset)} последовательностей")
+    print(f"   📦 Размер батча: {batch_size}")
+
+    return {
+        "train_loader": train_loader,
+        "val_loader": val_loader,
+        "test_loader": test_loader,
+        "scaler": scaler,
+        "encoders": encoders,
+        "feature_columns": available_features,
+        "input_dim": len(available_features),
+        "max_sequence_length": max_sequence_length,
+        "include_hole_cards": include_hole_cards,
+        "train_sequences": train_sequences_with_targets,
+        "val_sequences": val_sequences_with_targets,
+        "test_sequences": test_sequences_with_targets,
+    }
+
+
+def create_sequences_with_targets(sequences, feature_columns, scaled_data_dict):
+    """
+    Создает последовательности с правильно подготовленными целевыми переменными
+    """
+    print(f"🎯 Создание {len(sequences)} последовательностей с целевыми переменными...")
+
+    targets = {"hand_strength": [], "category_probs": [], "specific_hand": []}
+    valid_sequences = []
+    analyzer = PokerHandAnalyzer()
+
+    for seq_df in sequences:
+        try:
+            # Проверяем что последовательность не пустая
+            if len(seq_df) == 0:
+                continue
+
+            # Берем целевую переменную с последней записи в последовательности
+            last_row = seq_df.iloc[-1]
+
+            # Проверяем наличие нужных данных
+            if (
+                pd.notna(last_row.get("hand_strength"))
+                and pd.notna(last_row.get("Showdown_1"))
+                and pd.notna(last_row.get("Showdown_2"))
+            ):
+
+                # Сила руки
+                targets["hand_strength"].append(int(last_row["hand_strength"]))
+
+                # Категория руки
+                category_mapping = PokerHandAnalyzer.get_category_mapping()
+                category_idx = category_mapping.get(
+                    last_row.get("hand_category", "other"), 8
+                )
+
+                category_probs = np.zeros(9)
+                category_probs[category_idx] = 1.0
+                targets["category_probs"].append(category_probs)
+
+                # Конкретные ранги карт
+                specific_hand = np.zeros(13)
+                card1 = last_row["Showdown_1"]
+                card2 = last_row["Showdown_2"]
+
+                rank1, _ = analyzer.parse_card(card1)
+                rank2, _ = analyzer.parse_card(card2)
+
+                if rank1 is not None and rank2 is not None:
+                    # Преобразуем ранги в индексы (A=14 -> 12, K=13 -> 11, ..., 2=2 -> 0)
+                    rank1_idx = max(0, min(12, rank1 - 2))
+                    rank2_idx = max(0, min(12, rank2 - 2))
+
+                    specific_hand[rank1_idx] = 0.6
+                    specific_hand[rank2_idx] = 0.6
+
+                    # Немного вероятности на соседние ранги
+                    for offset in [-1, 1]:
+                        for rank_idx in [rank1_idx, rank2_idx]:
+                            neighbor_idx = rank_idx + offset
+                            if 0 <= neighbor_idx < 13:
+                                specific_hand[neighbor_idx] = 0.1
+
+                    # Нормализуем
+                    if specific_hand.sum() > 0:
+                        specific_hand = specific_hand / specific_hand.sum()
+                    else:
+                        specific_hand = np.ones(13) / 13
+                else:
+                    specific_hand = np.ones(13) / 13
+
+                targets["specific_hand"].append(specific_hand)
+                valid_sequences.append(seq_df)
+
+        except Exception as e:
+            # Пропускаем проблемные последовательности
+            continue
+
+    print(f"   ✅ Создано {len(valid_sequences)} валидных последовательностей")
+
+    return valid_sequences, targets
+
+
+def create_player_sequences(df, max_sequence_length=20, min_sequence_length=3):
+    """
+    Создание последовательностей действий игроков с улучшенной логикой
+    """
+    print(f"🔄 Создание последовательностей игроков...")
+    print(f"   📏 Длина: {min_sequence_length}-{max_sequence_length}")
+
+    sequences = []
+    sequence_info = []
+
+    # Группируем по игрокам
+    for player_id in df["PlayerID"].unique():
+        player_data = df[df["PlayerID"] == player_id].copy()
+
+        # Сортируем по времени
+        if "Timestamp" in player_data.columns:
+            player_data = player_data.sort_values("Timestamp")
+        elif "Round" in player_data.columns:
+            player_data = player_data.sort_values("Round")
+
+        player_records = len(player_data)
+
+        # Если у игрока слишком мало записей, создаем одну последовательность
+        if player_records < min_sequence_length:
+            if player_records > 0:
+                sequences.append(player_data)
+                sequence_info.append(
+                    {
+                        "player_id": player_id,
+                        "sequence_length": player_records,
+                        "type": "short_player_sequence",
+                    }
+                )
+            continue
+
+        # Для игроков с достаточным количеством записей создаем скользящие окна
+        sequences_created = 0
+
+        # Стратегия 1: Скользящие окна с шагом
+        step_size = max(1, max_sequence_length // 4)  # Шаг в 1/4 от макс длины
+
+        for start_idx in range(0, player_records - min_sequence_length + 1, step_size):
+            end_idx = min(start_idx + max_sequence_length, player_records)
+
+            if end_idx - start_idx >= min_sequence_length:
+                sequence = player_data.iloc[start_idx:end_idx].copy()
+                sequences.append(sequence)
+
+                sequence_info.append(
+                    {
+                        "player_id": player_id,
+                        "sequence_length": len(sequence),
+                        "start_idx": start_idx,
+                        "end_idx": end_idx,
+                        "type": "sliding_window",
+                    }
+                )
+
+                sequences_created += 1
+
+        # Стратегия 2: Если создали мало последовательностей, добавляем случайные сегменты
+        if sequences_created < 3 and player_records >= max_sequence_length:
+            for _ in range(2):  # Создаем еще 2 случайные последовательности
+                start_idx = np.random.randint(
+                    0, player_records - min_sequence_length + 1
+                )
+                seq_length = np.random.randint(
+                    min_sequence_length,
+                    min(max_sequence_length, player_records - start_idx) + 1,
+                )
+                end_idx = start_idx + seq_length
+
+                sequence = player_data.iloc[start_idx:end_idx].copy()
+                sequences.append(sequence)
+
+                sequence_info.append(
+                    {
+                        "player_id": player_id,
+                        "sequence_length": len(sequence),
+                        "start_idx": start_idx,
+                        "end_idx": end_idx,
+                        "type": "random_segment",
+                    }
+                )
+
+    print(f"   ✅ Создано {len(sequences)} последовательностей")
+    print(f"   📊 Игроков: {df['PlayerID'].nunique()}")
+    print(f"   📊 Средняя длина: {np.mean([len(seq) for seq in sequences]):.1f}")
+
+    # Статистика по типам последовательностей
+    type_counts = {}
+    for info in sequence_info:
+        seq_type = info.get("type", "unknown")
+        type_counts[seq_type] = type_counts.get(seq_type, 0) + 1
+
+    print(f"   📋 По типам:")
+    for seq_type, count in type_counts.items():
+        print(f"      {seq_type}: {count}")
+
+    return sequences, sequence_info
+
+
+def train_sequence_hand_range_model(
+    data_dict, hidden_dim=128, num_layers=3, epochs=25, lr=0.001
+):
+    """
+    Обучение RWKV модели с поддержкой последовательностей
+    """
+    print(f"🚀 === ОБУЧЕНИЕ RWKV МОДЕЛИ С ПОСЛЕДОВАТЕЛЬНОСТЯМИ ===")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🖥️  Устройство: {device}")
+
+    # Размеры выборок
+    train_size = len(data_dict["train_loader"].dataset)
+    val_size = len(data_dict["val_loader"].dataset)
+    test_size = len(data_dict["test_loader"].dataset)
+
+    print(f"📊 Размеры выборок:")
+    print(f"   🎓 Train: {train_size} последовательностей")
+    print(f"   🔍 Validation: {val_size} последовательностей")
+    print(f"   🧪 Test: {test_size} последовательностей")
+
+    if train_size == 0:
+        print("❌ Пустая обучающая выборка!")
+        return None, None
+
+    # Создание модели
+    model = SequenceHandRangeRWKV(
+        input_dim=data_dict["input_dim"],
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        max_sequence_length=data_dict["max_sequence_length"],
+    ).to(device)
+
+    print(f"🧠 Модель создана:")
+    print(f"   📥 Входных признаков: {data_dict['input_dim']}")
+    print(f"   🧮 Скрытых нейронов: {hidden_dim}")
+    print(f"   🏗️  Слоев RWKV: {num_layers}")
+    print(f"   📏 Макс. длина последовательности: {data_dict['max_sequence_length']}")
+
+    # Оптимизатор и планировщик
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", patience=5, factor=0.5, verbose=True
+    )
+
+    # Функции потерь
+    strength_criterion = nn.CrossEntropyLoss()
+    category_criterion = nn.BCEWithLogitsLoss()
+    specific_criterion = nn.MSELoss()
+
+    # История обучения
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_strength_acc": [],
+        "val_strength_acc": [],
+        "train_category_acc": [],
+        "val_category_acc": [],
+        "train_specific_mse": [],
+        "val_specific_mse": [],
+        "learning_rates": [],
+    }
+
+    best_val_loss = float("inf")
+    best_model_state = None
+    patience_counter = 0
+    early_stopping_patience = 8
+
+    print(f"\n🎯 Начинаем обучение на {epochs} эпох...")
+
+    for epoch in range(epochs):
+        epoch_start_time = datetime.now()
+
+        # ===================== ОБУЧЕНИЕ =====================
+        model.train()
+        train_losses = []
+        train_strength_correct = 0
+        train_strength_total = 0
+        train_category_correct = 0
+        train_category_total = 0
+        train_specific_mse_sum = 0
+        train_batches = 0
+
+        print(f"\n📈 Эпоха {epoch+1}/{epochs} - Обучение...")
+
+        for batch_idx, (inputs, targets) in enumerate(data_dict["train_loader"]):
+            # Перемещаем данные на устройство
+            inputs = inputs.to(device)  # [batch_size, seq_len, features]
+            target_strength = targets["hand_strength"].to(device)
+            target_category = targets["category_probs"].to(device)
+            target_specific = targets["specific_hand"].to(device)
+            seq_lengths = targets["sequence_length"].to(device)
+
+            # ВАЖНО: Сброс состояния модели для каждого батча
+            model.reset_states()
+            optimizer.zero_grad()
+
+            # Прямой проход
+            outputs = model(inputs)
+
+            # Вычисление потерь
+            strength_loss = strength_criterion(
+                outputs["hand_strength"], target_strength
+            )
+            category_loss = category_criterion(
+                outputs["category_probs"], target_category
+            )
+            specific_loss = specific_criterion(
+                outputs["specific_hand"], target_specific
+            )
+
+            # Взвешенная общая потеря
+            total_loss = strength_loss + 0.5 * category_loss + 0.3 * specific_loss
+
+            # Обратный проход
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # Метрики
+            train_losses.append(total_loss.item())
+
+            # Точность силы руки
+            _, predicted_strength = torch.max(outputs["hand_strength"], 1)
+            train_strength_total += target_strength.size(0)
+            train_strength_correct += (
+                (predicted_strength == target_strength).sum().item()
+            )
+
+            # Точность категории
+            predicted_category = (
+                torch.sigmoid(outputs["category_probs"]) > 0.5
+            ).float()
+            train_category_total += target_category.numel()
+            train_category_correct += (
+                (predicted_category == target_category).sum().item()
+            )
+
+            # MSE для конкретных рангов
+            train_specific_mse_sum += specific_loss.item()
+            train_batches += 1
+
+            # Прогресс
+            if (batch_idx + 1) % max(1, len(data_dict["train_loader"]) // 10) == 0:
+                progress = (batch_idx + 1) / len(data_dict["train_loader"]) * 100
+                current_loss = total_loss.item()
+                print(f"   📊 {progress:5.1f}% | Loss: {current_loss:.4f}")
+
+        # ===================== ВАЛИДАЦИЯ =====================
+        model.eval()
+        val_losses = []
+        val_strength_correct = 0
+        val_strength_total = 0
+        val_category_correct = 0
+        val_category_total = 0
+        val_specific_mse_sum = 0
+        val_batches = 0
+
+        print(f"🔍 Валидация...")
+
+        with torch.no_grad():
+            for inputs, targets in data_dict["val_loader"]:
+                inputs = inputs.to(device)
+                target_strength = targets["hand_strength"].to(device)
+                target_category = targets["category_probs"].to(device)
+                target_specific = targets["specific_hand"].to(device)
+
+                model.reset_states()
+                outputs = model(inputs)
+
+                # Потери
+                strength_loss = strength_criterion(
+                    outputs["hand_strength"], target_strength
+                )
+                category_loss = category_criterion(
+                    outputs["category_probs"], target_category
+                )
+                specific_loss = specific_criterion(
+                    outputs["specific_hand"], target_specific
+                )
+                total_loss = strength_loss + 0.5 * category_loss + 0.3 * specific_loss
+
+                val_losses.append(total_loss.item())
+
+                # Метрики
+                _, predicted_strength = torch.max(outputs["hand_strength"], 1)
+                val_strength_total += target_strength.size(0)
+                val_strength_correct += (
+                    (predicted_strength == target_strength).sum().item()
+                )
+
+                predicted_category = (
+                    torch.sigmoid(outputs["category_probs"]) > 0.5
+                ).float()
+                val_category_total += target_category.numel()
+                val_category_correct += (
+                    (predicted_category == target_category).sum().item()
+                )
+
+                val_specific_mse_sum += specific_loss.item()
+                val_batches += 1
+
+        # ===================== МЕТРИКИ ЭПОХИ =====================
+        avg_train_loss = np.mean(train_losses) if train_losses else 0
+        avg_val_loss = np.mean(val_losses) if val_losses else 0
+
+        train_strength_acc = train_strength_correct / max(train_strength_total, 1)
+        val_strength_acc = val_strength_correct / max(val_strength_total, 1)
+
+        train_category_acc = train_category_correct / max(train_category_total, 1)
+        val_category_acc = val_category_correct / max(val_category_total, 1)
+
+        train_specific_mse = train_specific_mse_sum / max(train_batches, 1)
+        val_specific_mse = val_specific_mse_sum / max(val_batches, 1)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # Сохранение в историю
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(avg_val_loss)
+        history["train_strength_acc"].append(train_strength_acc)
+        history["val_strength_acc"].append(val_strength_acc)
+        history["train_category_acc"].append(train_category_acc)
+        history["val_category_acc"].append(val_category_acc)
+        history["train_specific_mse"].append(train_specific_mse)
+        history["val_specific_mse"].append(val_specific_mse)
+        history["learning_rates"].append(current_lr)
+
+        # Время эпохи
+        epoch_time = (datetime.now() - epoch_start_time).total_seconds()
+
+        # Вывод результатов эпохи
+        print(f"\n📊 Эпоха {epoch+1}/{epochs} завершена за {epoch_time:.1f}с:")
+        print(f"   📉 Потери: train={avg_train_loss:.4f}, val={avg_val_loss:.4f}")
+        print(
+            f"   🎯 Точность силы: train={train_strength_acc:.3f}, val={val_strength_acc:.3f}"
+        )
+        print(
+            f"   🏷️  Точность категории: train={train_category_acc:.3f}, val={val_category_acc:.3f}"
+        )
+        print(
+            f"   📊 MSE рангов: train={train_specific_mse:.4f}, val={val_specific_mse:.4f}"
+        )
+        print(f"   📈 Learning rate: {current_lr:.6f}")
+
+        # Обновление планировщика
+        scheduler.step(avg_val_loss)
+
+        # Ранняя остановка и сохранение лучшей модели
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_state = model.state_dict().copy()
+            patience_counter = 0
+            print(f"   ⭐ Новая лучшая модель! Val loss: {best_val_loss:.4f}")
+        else:
+            patience_counter += 1
+            print(f"   ⏳ Patience: {patience_counter}/{early_stopping_patience}")
+
+        # Проверка ранней остановки
+        if patience_counter >= early_stopping_patience:
+            print(f"\n🛑 Ранняя остановка на эпохе {epoch+1}")
+            print(f"   📈 Лучший val loss: {best_val_loss:.4f}")
+            break
+
+    # Загружаем лучшие веса
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"✅ Загружены веса лучшей модели (val loss: {best_val_loss:.4f})")
+
+    print(f"\n🎉 Обучение завершено!")
+    return model, history
+
+
+def evaluate_sequence_model_performance(model, data_dict, include_hole_cards=True):
+    """
+    Детальная оценка производительности последовательной модели
+    """
+    print(f"\n🔍 === ОЦЕНКА МОДЕЛИ ===")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+
+    all_outputs = {
+        "strength_pred": [],
+        "strength_true": [],
+        "category_pred": [],
+        "category_true": [],
+        "specific_pred": [],
+        "specific_true": [],
+        "sequence_lengths": [],
+    }
+
+    total_sequences = 0
+    correct_predictions = 0
+
+    with torch.no_grad():
+        for inputs, targets in data_dict["test_loader"]:
+            inputs = inputs.to(device)
+            seq_lengths = targets["sequence_length"]
+
+            model.reset_states()
+            outputs = model(inputs)
+
+            # Собираем предсказания
+            _, strength_pred = torch.max(outputs["hand_strength"], 1)
+            all_outputs["strength_pred"].extend(strength_pred.cpu().numpy())
+            all_outputs["strength_true"].extend(targets["hand_strength"].numpy())
+
+            # Категории
+            category_pred = torch.sigmoid(outputs["category_probs"]).cpu().numpy()
+            category_true = targets["category_probs"].numpy()
+            all_outputs["category_pred"].extend(np.argmax(category_pred, axis=1))
+            all_outputs["category_true"].extend(np.argmax(category_true, axis=1))
+
+            # Конкретные ранги
+            all_outputs["specific_pred"].extend(outputs["specific_hand"].cpu().numpy())
+            all_outputs["specific_true"].extend(targets["specific_hand"].numpy())
+
+            # Длины последовательностей
+            all_outputs["sequence_lengths"].extend(seq_lengths.numpy())
+
+            total_sequences += len(strength_pred)
+            correct_predictions += (
+                (strength_pred.cpu() == targets["hand_strength"]).sum().item()
+            )
+
+    # Вычисляем метрики
+    from sklearn.metrics import (
+        accuracy_score,
+        classification_report,
+        mean_squared_error,
+    )
+
+    strength_accuracy = accuracy_score(
+        all_outputs["strength_true"], all_outputs["strength_pred"]
+    )
+    category_accuracy = accuracy_score(
+        all_outputs["category_true"], all_outputs["category_pred"]
+    )
+    specific_mse = mean_squared_error(
+        all_outputs["specific_true"], all_outputs["specific_pred"]
+    )
+
+    model_type = "с картами игрока" if include_hole_cards else "без карт игрока"
+    print(f"📊 Результаты модели {model_type}:")
+    print(f"   🎯 Точность силы руки: {strength_accuracy:.3f}")
+    print(f"   🏷️  Точность категории: {category_accuracy:.3f}")
+    print(f"   📊 MSE рангов карт: {specific_mse:.4f}")
+    print(f"   📈 Всего последовательностей: {total_sequences}")
+
+    # Анализ по длине последовательностей
+    seq_lengths = np.array(all_outputs["sequence_lengths"])
+    strength_preds = np.array(all_outputs["strength_pred"])
+    strength_true = np.array(all_outputs["strength_true"])
+
+    print(f"\n📏 Анализ по длине последовательностей:")
+    for seq_len in sorted(set(seq_lengths)):
+        mask = seq_lengths == seq_len
+        if mask.sum() > 0:
+            acc = accuracy_score(strength_true[mask], strength_preds[mask])
+            count = mask.sum()
+            print(f"   Длина {seq_len:2d}: {acc:.3f} точность ({count:3d} примеров)")
+
+    # Детальный отчет по категориям
+    category_names = PokerHandAnalyzer.get_all_categories()
+    print(f"\n🏷️  Отчет по категориям рук:")
+    try:
+        class_report = classification_report(
+            all_outputs["category_true"],
+            all_outputs["category_pred"],
+            target_names=category_names,
+            zero_division=0,
+            output_dict=True,
+        )
+
+        for category, metrics in class_report.items():
+            if isinstance(metrics, dict) and category in category_names:
+                print(
+                    f"   {category:20s}: precision={metrics['precision']:.3f}, "
+                    f"recall={metrics['recall']:.3f}, f1={metrics['f1-score']:.3f}"
+                )
+
+    except Exception as e:
+        print(f"   ⚠️  Не удалось создать детальный отчет: {e}")
+
+    return {
+        "strength_accuracy": strength_accuracy,
+        "category_accuracy": category_accuracy,
+        "specific_mse": specific_mse,
+        "total_sequences": total_sequences,
+        **all_outputs,
+    }
+
+
+def visualize_sequence_results(model, data_dict, history, include_hole_cards=True):
+    """
+    Визуализация результатов обучения последовательной модели
+    """
+    print(f"📊 Создание графиков...")
+
+    fig, axes = plt.subplots(3, 2, figsize=(15, 18))
+
+    # 1. Потери обучения
+    axes[0, 0].plot(history["train_loss"], label="Train", linewidth=2)
+    axes[0, 0].plot(history["val_loss"], label="Validation", linewidth=2)
+    axes[0, 0].set_title("Потери обучения", fontsize=14, fontweight="bold")
+    axes[0, 0].set_xlabel("Эпоха")
+    axes[0, 0].set_ylabel("Потери")
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # 2. Точность силы руки
+    axes[0, 1].plot(history["train_strength_acc"], label="Train", linewidth=2)
+    axes[0, 1].plot(history["val_strength_acc"], label="Validation", linewidth=2)
+    axes[0, 1].set_title(
+        "Точность предсказания силы руки", fontsize=14, fontweight="bold"
+    )
+    axes[0, 1].set_xlabel("Эпоха")
+    axes[0, 1].set_ylabel("Точность")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # 3. Точность категорий
+    axes[1, 0].plot(history["train_category_acc"], label="Train", linewidth=2)
+    axes[1, 0].plot(history["val_category_acc"], label="Validation", linewidth=2)
+    axes[1, 0].set_title(
+        "Точность предсказания категорий", fontsize=14, fontweight="bold"
+    )
+    axes[1, 0].set_xlabel("Эпоха")
+    axes[1, 0].set_ylabel("Точность")
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # 4. MSE конкретных рангов
+    axes[1, 1].plot(history["train_specific_mse"], label="Train", linewidth=2)
+    axes[1, 1].plot(history["val_specific_mse"], label="Validation", linewidth=2)
+    axes[1, 1].set_title("MSE предсказания рангов карт", fontsize=14, fontweight="bold")
+    axes[1, 1].set_xlabel("Эпоха")
+    axes[1, 1].set_ylabel("MSE")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+
+    # 5. Learning Rate
+    axes[2, 0].plot(history["learning_rates"], linewidth=2, color="red")
+    axes[2, 0].set_title("Learning Rate", fontsize=14, fontweight="bold")
+    axes[2, 0].set_xlabel("Эпоха")
+    axes[2, 0].set_ylabel("Learning Rate")
+    axes[2, 0].set_yscale("log")
+    axes[2, 0].grid(True, alpha=0.3)
+
+    # 6. Матрица ошибок для силы руки
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+
+    all_predictions = []
+    all_targets = []
+
+    with torch.no_grad():
+        for inputs, targets in data_dict["test_loader"]:
+            inputs = inputs.to(device)
+            model.reset_states()
+            outputs = model(inputs)
+
+            _, strength_pred = torch.max(outputs["hand_strength"], 1)
+            all_predictions.extend(strength_pred.cpu().numpy())
+            all_targets.extend(targets["hand_strength"].numpy())
+
+    from sklearn.metrics import confusion_matrix
+
+    cm = confusion_matrix(all_targets, all_predictions)
+
+    im = axes[2, 1].imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    axes[2, 1].set_title("Матрица ошибок: Сила руки", fontsize=14, fontweight="bold")
+    axes[2, 1].set_xlabel("Предсказанная сила")
+    axes[2, 1].set_ylabel("Истинная сила")
+
+    # Добавляем числа в матрицу
+    thresh = cm.max() / 2.0
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            axes[2, 1].text(
+                j,
+                i,
+                str(cm[i, j]),
+                ha="center",
+                va="center",
+                color="white" if cm[i, j] > thresh else "black",
+                fontsize=8,
+            )
+
+    # Общий заголовок
+    model_type = "с картами игрока" if include_hole_cards else "без карт игрока"
+    fig.suptitle(
+        f"Результаты обучения RWKV модели ({model_type})",
+        fontsize=16,
+        fontweight="bold",
+    )
+
+    plt.tight_layout()
+
+    # Сохранение
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plot_name = f"sequence_training_results_{'with_cards' if include_hole_cards else 'without_cards'}_{timestamp}.png"
+
+    os.makedirs("plots", exist_ok=True)
+    plot_path = os.path.join("plots", plot_name)
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    print(f"📊 График сохранен: {plot_path}")
+
+    return fig, plot_path
+
+
+def predict_sequence_hand_ranges(model, data_dict, sample_hands=5):
+    """
+    Демонстрация предсказаний последовательной модели
+    """
+    print(f"\n🎲 === ПРИМЕРЫ ПРЕДСКАЗАНИЙ ===")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+
+    category_names = PokerHandAnalyzer.get_all_categories()
+    rank_names = PokerHandAnalyzer.get_rank_names()
+
+    shown_examples = 0
+
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(data_dict["test_loader"]):
+            if shown_examples >= sample_hands:
+                break
+
+            inputs = inputs.to(device)
+            seq_lengths = targets["sequence_length"]
+
+            model.reset_states()
+            outputs = model(inputs)
+
+            batch_size = inputs.size(0)
+
+            for sample_idx in range(min(batch_size, sample_hands - shown_examples)):
+                # Длина последовательности
+                seq_len = seq_lengths[sample_idx].item()
+
+                # Предсказания
+                strength_probs = torch.softmax(outputs["hand_strength"], dim=1)[
+                    sample_idx
+                ]
+                predicted_strength = torch.argmax(strength_probs).item()
+                strength_confidence = strength_probs[predicted_strength].item()
+
+                category_probs = torch.sigmoid(outputs["category_probs"])[sample_idx]
+                predicted_category = torch.argmax(category_probs).item()
+                category_confidence = category_probs[predicted_category].item()
+
+                specific_probs = outputs["specific_hand"][sample_idx]
+
+                # Истинные значения
+                true_strength = targets["hand_strength"][sample_idx].item()
+                true_category = torch.argmax(
+                    targets["category_probs"][sample_idx]
+                ).item()
+
+                print(f"\n🎯 Пример {shown_examples + 1}:")
+                print(f"   📏 Длина последовательности: {seq_len}")
+                print(f"   💪 Истинная сила: {true_strength}")
+                print(
+                    f"   🎯 Предсказанная сила: {predicted_strength} (уверенность: {strength_confidence:.3f})"
+                )
+                print(f"   🏷️  Истинная категория: {category_names[true_category]}")
+                print(
+                    f"   🏷️  Предсказанная категория: {category_names[predicted_category]} (вероятность: {category_confidence:.3f})"
+                )
+
+                # Топ-3 наиболее вероятных ранга
+                top_ranks = torch.topk(specific_probs, 3)
+                print(f"   🃏 Топ-3 вероятных ранга:")
+                for j, (prob, rank_idx) in enumerate(
+                    zip(top_ranks.values, top_ranks.indices)
+                ):
+                    print(f"      {j+1}. {rank_names[rank_idx]}: {prob:.3f}")
+
+                # Анализ правильности
+                strength_correct = "✅" if predicted_strength == true_strength else "❌"
+                category_correct = "✅" if predicted_category == true_category else "❌"
+                print(
+                    f"   📊 Результат: сила {strength_correct}, категория {category_correct}"
+                )
+
+                shown_examples += 1
+
+                if shown_examples >= sample_hands:
+                    break
+
+    print(f"\n💡 Показано {shown_examples} примеров предсказаний")
+
+
+def analyze_optimal_sequence_length(df, percentile=95):
+    """
+    Анализирует данные и определяет оптимальную длину последовательности
+
+    Args:
+        df: DataFrame с данными
+        percentile: процентиль для определения максимальной длины (по умолчанию 95%)
+
+    Returns:
+        dict с рекомендациями по длине последовательности
+    """
+    print(f"📊 === АНАЛИЗ ОПТИМАЛЬНОЙ ДЛИНЫ ПОСЛЕДОВАТЕЛЬНОСТИ ===")
+
+    # Группируем по игрокам и рукам
+    if "HandID" in df.columns:
+        hand_lengths = df.groupby("HandID").size()
+        print(f"📋 Анализ по рукам (HandID):")
+        print(f"   Количество уникальных рук: {len(hand_lengths):,}")
+        print(f"   Средняя длина руки: {hand_lengths.mean():.1f} действий")
+        print(f"   Медиана: {hand_lengths.median():.0f}")
+        print(f"   Мин/Макс: {hand_lengths.min()}/{hand_lengths.max()}")
+
+        # Распределение длин
+        print(f"\n   Распределение длин рук:")
+        for pct in [50, 75, 90, 95, 99]:
+            pct_value = hand_lengths.quantile(pct / 100)
+            print(f"   {pct}%: {pct_value:.0f} действий")
+
+    # Анализ по игрокам и временным сессиям
+    player_sequences = []
+
+    for player_id in df["PlayerID"].unique():
+        player_data = df[df["PlayerID"] == player_id].copy()
+
+        # Сортируем по времени
+        if "Timestamp" in player_data.columns:
+            player_data = player_data.sort_values("Timestamp")
+
+        # Определяем сессии (группы действий с разрывом < threshold)
+        if "Timestamp" in player_data.columns and player_data["Timestamp"].dtype in [
+            "int64",
+            "float64",
+        ]:
+            time_diffs = player_data["Timestamp"].diff()
+
+            # Пороговое значение для разделения сессий (например, 30 минут или 30 раундов)
+            session_threshold = time_diffs.quantile(0.9) if len(time_diffs) > 10 else 30
+
+            # Создаем группы сессий
+            session_breaks = (time_diffs > session_threshold).cumsum()
+            sessions = player_data.groupby(session_breaks).size()
+
+            player_sequences.extend(sessions.tolist())
+        else:
+            # Если нет временных меток, берем всю историю игрока как одну последовательность
+            player_sequences.append(len(player_data))
+
+    if player_sequences:
+        player_sequences = pd.Series(player_sequences)
+        print(f"\n📊 Анализ последовательностей игроков:")
+        print(f"   Найдено последовательностей: {len(player_sequences):,}")
+        print(f"   Средняя длина: {player_sequences.mean():.1f}")
+        print(f"   Медиана: {player_sequences.median():.0f}")
+        print(f"   Стд. отклонение: {player_sequences.std():.1f}")
+
+        # Определяем оптимальные параметры
+        optimal_max = int(player_sequences.quantile(percentile / 100))
+        optimal_min = max(3, int(player_sequences.quantile(0.1)))  # Минимум 3 действия
+        recommended = int(
+            player_sequences.quantile(0.75)
+        )  # 75 процентиль как рекомендация
+
+        print(f"\n🎯 Рекомендации:")
+        print(f"   Минимальная длина: {optimal_min}")
+        print(f"   Рекомендуемая длина: {recommended}")
+        print(f"   Максимальная длина: {optimal_max} ({percentile}% покрытие)")
+
+        # Анализ покрытия данных
+        coverage_80 = (
+            (player_sequences <= recommended).sum() / len(player_sequences) * 100
+        )
+        coverage_95 = (
+            (player_sequences <= optimal_max).sum() / len(player_sequences) * 100
+        )
+
+        print(f"\n📈 Покрытие данных:")
+        print(f"   При длине {recommended}: {coverage_80:.1f}% последовательностей")
+        print(f"   При длине {optimal_max}: {coverage_95:.1f}% последовательностей")
+
+        # Анализ потерь при обрезке
+        truncated_actions = (
+            player_sequences[player_sequences > optimal_max].sum()
+            - len(player_sequences[player_sequences > optimal_max]) * optimal_max
+        )
+        total_actions = player_sequences.sum()
+        loss_percentage = truncated_actions / total_actions * 100
+
+        print(f"\n✂️ Потери при обрезке до {optimal_max}:")
+        print(f"   Обрезанных действий: {truncated_actions:,}")
+        print(f"   Процент потерь: {loss_percentage:.2f}%")
+
+        return {
+            "min_length": optimal_min,
+            "recommended_length": recommended,
+            "max_length": optimal_max,
+            "mean_length": player_sequences.mean(),
+            "median_length": player_sequences.median(),
+            "coverage_at_max": coverage_95,
+            "data_loss_percentage": loss_percentage,
+            "total_sequences": len(player_sequences),
+        }
+
+    else:
+        print("⚠️ Не удалось проанализировать последовательности")
+        # Возвращаем значения по умолчанию
+        return {
+            "min_length": 3,
+            "recommended_length": 10,
+            "max_length": 20,
+            "mean_length": 10,
+            "median_length": 10,
+            "coverage_at_max": 100,
+            "data_loss_percentage": 0,
+            "total_sequences": 0,
+        }
+
+
+def create_adaptive_sequences(df, sequence_params, balance_strategy="adaptive"):
+    """
+    Создает последовательности с адаптивными параметрами
+
+    Args:
+        df: DataFrame с данными
+        sequence_params: параметры из analyze_optimal_sequence_length
+        balance_strategy: стратегия балансировки ('adaptive', 'fixed', 'mixed')
+    """
+    print(f"\n🔄 === СОЗДАНИЕ АДАПТИВНЫХ ПОСЛЕДОВАТЕЛЬНОСТЕЙ ===")
+    print(f"📏 Параметры:")
+    print(f"   Минимум: {sequence_params['min_length']}")
+    print(f"   Рекомендуемая: {sequence_params['recommended_length']}")
+    print(f"   Максимум: {sequence_params['max_length']}")
+    print(f"   Стратегия: {balance_strategy}")
+
+    sequences = []
+    sequence_info = []
+
+    for player_id in df["PlayerID"].unique():
+        player_data = df[df["PlayerID"] == player_id].copy()
+
+        if "Timestamp" in player_data.columns:
+            player_data = player_data.sort_values("Timestamp")
+
+        player_records = len(player_data)
+
+        if balance_strategy == "adaptive":
+            # Адаптивная стратегия: разные длины для разных игроков
+            if player_records < sequence_params["min_length"]:
+                continue
+
+            # Короткие последовательности для игроков с мало данных
+            if player_records < sequence_params["recommended_length"]:
+                sequences.append(player_data)
+                sequence_info.append(
+                    {
+                        "player_id": player_id,
+                        "length": player_records,
+                        "type": "short_full",
+                    }
+                )
+
+            # Средние последовательности
+            elif player_records < sequence_params["max_length"]:
+                # Создаем перекрывающиеся окна
+                step = max(1, player_records // 3)
+                for start in range(
+                    0, player_records - sequence_params["min_length"] + 1, step
+                ):
+                    end = min(
+                        start + sequence_params["recommended_length"], player_records
+                    )
+                    sequences.append(player_data.iloc[start:end])
+                    sequence_info.append(
+                        {
+                            "player_id": player_id,
+                            "length": end - start,
+                            "type": "medium_window",
+                        }
+                    )
+
+            # Длинные последовательности
+            else:
+                # Используем скользящее окно с адаптивным шагом
+                window_size = sequence_params["recommended_length"]
+                step = max(1, window_size // 2)
+
+                for start in range(0, player_records - window_size + 1, step):
+                    end = start + window_size
+                    sequences.append(player_data.iloc[start:end])
+                    sequence_info.append(
+                        {
+                            "player_id": player_id,
+                            "length": window_size,
+                            "type": "sliding_window",
+                        }
+                    )
+
+                # Добавляем последнюю последовательность полной длины
+                if player_records > sequence_params["max_length"]:
+                    sequences.append(player_data.iloc[-sequence_params["max_length"] :])
+                    sequence_info.append(
+                        {
+                            "player_id": player_id,
+                            "length": sequence_params["max_length"],
+                            "type": "tail_max",
+                        }
+                    )
+
+        elif balance_strategy == "mixed":
+            # Смешанная стратегия: комбинация разных длин
+            if player_records >= sequence_params["min_length"]:
+                # Короткие последовательности (для начала игры)
+                for length in [5, 10, 15]:
+                    if length <= player_records:
+                        sequences.append(player_data.iloc[:length])
+                        sequence_info.append(
+                            {
+                                "player_id": player_id,
+                                "length": length,
+                                "type": f"fixed_{length}",
+                            }
+                        )
+
+                # Случайные сегменты
+                if player_records > sequence_params["recommended_length"]:
+                    for _ in range(2):
+                        start = np.random.randint(
+                            0, player_records - sequence_params["min_length"]
+                        )
+                        length = np.random.randint(
+                            sequence_params["min_length"],
+                            min(
+                                sequence_params["recommended_length"],
+                                player_records - start,
+                            ),
+                        )
+                        sequences.append(player_data.iloc[start : start + length])
+                        sequence_info.append(
+                            {
+                                "player_id": player_id,
+                                "length": length,
+                                "type": "random_segment",
+                            }
+                        )
+
+    # Статистика
+    lengths = [info["length"] for info in sequence_info]
+    type_counts = {}
+    for info in sequence_info:
+        seq_type = info["type"]
+        type_counts[seq_type] = type_counts.get(seq_type, 0) + 1
+
+    print(f"\n📊 Создано последовательностей: {len(sequences)}")
+    print(f"   Средняя длина: {np.mean(lengths):.1f}")
+    print(f"   Распределение длин:")
+    print(
+        f"   - Короткие (<{sequence_params['recommended_length']}): "
+        f"{sum(1 for l in lengths if l < sequence_params['recommended_length'])}"
+    )
+    print(
+        f"   - Средние: "
+        f"{sum(1 for l in lengths if sequence_params['recommended_length'] <= l < sequence_params['max_length'])}"
+    )
+    print(
+        f"   - Максимальные (={sequence_params['max_length']}): "
+        f"{sum(1 for l in lengths if l == sequence_params['max_length'])}"
+    )
+
+    print(f"\n📋 По типам создания:")
+    for seq_type, count in sorted(
+        type_counts.items(), key=lambda x: x[1], reverse=True
+    ):
+        print(f"   {seq_type}: {count}")
+
+    return sequences, sequence_info, sequence_params
+
+
+# -----------------------------------------------------------------
+
+
 # ---------------------- 7. Главная функция ----------------------
 def main():
     """Главная функция для обучения и оценки моделей"""
@@ -1603,5 +3481,502 @@ def main():
     print(f"   🃏 results/poker_categories.json - категории рук")
 
 
+# if __name__ == "__main__":
+#     main()
+
+
+def main_with_sequences():
+    """
+    Обновленная главная функция с поддержкой последовательностей и комбинированного разделения данных
+    """
+    print("🎰 === ОБУЧЕНИЕ RWKV МОДЕЛЕЙ С ПОСЛЕДОВАТЕЛЬНОСТЯМИ ===\n")
+
+    # Создаем необходимые папки
+    setup_directories()
+    save_categories_json()
+
+    # Выбираем файл данных
+    data_choice = choose_data_file()
+    if not data_choice:
+        print("👋 Выход из программы.")
+        return
+
+    # Проверяем массовую обработку
+    if data_choice == "COMBINE_ALL":
+        process_all_files_with_sequences()
+        return
+
+    # Обычная обработка одного файла
+    data_path = data_choice
+
+    # Анализ файла данных
+    print(f"\n📊 === АНАЛИЗ ДАННЫХ ===")
+    df_check = pd.read_csv(data_path)
+    showdown_count = (
+        (df_check["Showdown_1"].notna()) & (df_check["Showdown_2"].notna())
+    ).sum()
+    total_rows = len(df_check)
+
+    print(f"📈 Общий размер файла: {total_rows:,} строк")
+    print(f"🃏 Записей с открытыми картами: {showdown_count:,}")
+    print(f"📊 Процент шоудаунов: {showdown_count/total_rows*100:.1f}%")
+
+    if showdown_count < 50:
+        print("⚠️  Внимание: мало данных для качественного обучения!")
+        print("💡 Рекомендуется использовать опцию объединения всех файлов")
+    else:
+        print("✅ Достаточно данных для обучения последовательных моделей")
+
+    results = {}
+    all_plots = []
+
+    # Параметры обучения
+    max_sequence_length = 15  # Оптимальная длина для покера
+    training_params = {"hidden_dim": 128, "num_layers": 3, "epochs": 25, "lr": 0.001}
+
+    print(f"\n🎯 Параметры обучения:")
+    print(f"   📏 Максимальная длина последовательности: {max_sequence_length}")
+    print(f"   🧠 Скрытых нейронов: {training_params['hidden_dim']}")
+    print(f"   🏗️  Слоев RWKV: {training_params['num_layers']}")
+    print(f"   📚 Эпох обучения: {training_params['epochs']}")
+    print(f"   📈 Learning rate: {training_params['lr']}")
+
+    # ======================================================================
+    # 1. МОДЕЛЬ С КАРТАМИ ИГРОКА
+    # ======================================================================
+    print(f"\n" + "=" * 80)
+    print(f"🎯 1. ОБУЧЕНИЕ МОДЕЛИ С КАРТАМИ ИГРОКА (последовательности)")
+    print(f"=" * 80)
+
+    try:
+        print(f"📥 Подготовка данных с картами игрока...")
+        data_with_cards = prepare_sequence_hand_range_data(
+            data_path, include_hole_cards=True, max_sequence_length=max_sequence_length
+        )
+
+        if data_with_cards is not None:
+            print(f"🚀 Запуск обучения...")
+            model_with_cards, history_with_cards = train_sequence_hand_range_model(
+                data_with_cards, **training_params
+            )
+
+            # Оценка модели
+            print(f"🔍 Оценка производительности...")
+            results["with_cards"] = evaluate_sequence_model_performance(
+                model_with_cards, data_with_cards, include_hole_cards=True
+            )
+
+            # Визуализация
+            print(f"📊 Создание графиков...")
+            fig1, plot_path1 = visualize_sequence_results(
+                model_with_cards, data_with_cards, history_with_cards, True
+            )
+            all_plots.append(plot_path1)
+            plt.show()
+
+            # Примеры предсказаний
+            predict_sequence_hand_ranges(
+                model_with_cards, data_with_cards, sample_hands=3
+            )
+
+            # Сохранение модели
+            model_path, best_path = save_sequence_model(
+                model_with_cards, data_with_cards, results["with_cards"], True
+            )
+
+            print(f"✅ Модель с картами обучена успешно!")
+
+        else:
+            print("❌ Не удалось подготовить данные для модели с картами")
+
+    except Exception as e:
+        print(f"❌ Ошибка при обучении модели с картами: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    # ======================================================================
+    # 2. МОДЕЛЬ БЕЗ КАРТ ИГРОКА
+    # ======================================================================
+    print(f"\n" + "=" * 80)
+    print(f"🎲 2. ОБУЧЕНИЕ МОДЕЛИ БЕЗ КАРТ ИГРОКА (последовательности)")
+    print(f"   🎯 Цель: угадать карты по поведению в последовательности действий")
+    print(f"=" * 80)
+
+    try:
+        print(f"📥 Подготовка данных без карт игрока...")
+        data_without_cards = prepare_sequence_hand_range_data(
+            data_path, include_hole_cards=False, max_sequence_length=max_sequence_length
+        )
+
+        if data_without_cards is not None:
+            print(f"🚀 Запуск обучения...")
+            model_without_cards, history_without_cards = (
+                train_sequence_hand_range_model(data_without_cards, **training_params)
+            )
+
+            # Оценка модели
+            print(f"🔍 Оценка производительности...")
+            results["without_cards"] = evaluate_sequence_model_performance(
+                model_without_cards, data_without_cards, include_hole_cards=False
+            )
+
+            # Визуализация
+            print(f"📊 Создание графиков...")
+            fig2, plot_path2 = visualize_sequence_results(
+                model_without_cards, data_without_cards, history_without_cards, False
+            )
+            all_plots.append(plot_path2)
+            plt.show()
+
+            # Примеры предсказаний
+            predict_sequence_hand_ranges(
+                model_without_cards, data_without_cards, sample_hands=3
+            )
+
+            # Сохранение модели
+            model_path, best_path = save_sequence_model(
+                model_without_cards, data_without_cards, results["without_cards"], False
+            )
+
+            print(f"✅ Модель без карт обучена успешно!")
+
+        else:
+            print("❌ Не удалось подготовать данные для модели без карт")
+
+    except Exception as e:
+        print(f"❌ Ошибка при обучении модели без карт: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+    # ======================================================================
+    # 3. СРАВНЕНИЕ МОДЕЛЕЙ
+    # ======================================================================
+    print(f"\n" + "=" * 80)
+    print(f"🏆 === СРАВНЕНИЕ ПОСЛЕДОВАТЕЛЬНЫХ МОДЕЛЕЙ ===")
+    print(f"=" * 80)
+
+    if "with_cards" in results and "without_cards" in results:
+        with_cards_acc = results["with_cards"]["strength_accuracy"]
+        without_cards_acc = results["without_cards"]["strength_accuracy"]
+
+        with_cards_cat_acc = results["with_cards"]["category_accuracy"]
+        without_cards_cat_acc = results["without_cards"]["category_accuracy"]
+
+        with_cards_mse = results["with_cards"]["specific_mse"]
+        without_cards_mse = results["without_cards"]["specific_mse"]
+
+        print(f"📊 Сравнение точности предсказания силы руки:")
+        print(f"   🎯 С картами игрока: {with_cards_acc:.3f}")
+        print(f"   🎲 Без карт игрока: {without_cards_acc:.3f}")
+        print(f"   📈 Разница: {with_cards_acc - without_cards_acc:.3f}")
+
+        print(f"\n📊 Сравнение точности категорий:")
+        print(f"   🎯 С картами: {with_cards_cat_acc:.3f}")
+        print(f"   🎲 Без карт: {without_cards_cat_acc:.3f}")
+        print(f"   📈 Разница: {with_cards_cat_acc - without_cards_cat_acc:.3f}")
+
+        print(f"\n📊 Сравнение MSE рангов:")
+        print(f"   🎯 С картами: {with_cards_mse:.4f}")
+        print(f"   🎲 Без карт: {without_cards_mse:.4f}")
+        print(f"   📈 Разница: {with_cards_mse - without_cards_mse:.4f}")
+
+        # Интерпретация результатов
+        print(f"\n🧠 === ИНТЕРПРЕТАЦИЯ РЕЗУЛЬТАТОВ ===")
+
+        strength_diff = with_cards_acc - without_cards_acc
+        if strength_diff > 0.1:
+            print(f"✅ Модель с картами значительно лучше (+{strength_diff:.1%})")
+            print(f"   💡 Это ожидаемо: зная карты, модель должна предсказывать лучше")
+        elif strength_diff > 0.05:
+            print(f"✅ Модель с картами лучше (+{strength_diff:.1%})")
+            print(f"   💡 Умеренное преимущество")
+        elif abs(strength_diff) <= 0.05:
+            print(
+                f"🤔 Модели показывают сопоставимую точность (±{abs(strength_diff):.1%})"
+            )
+            print(
+                f"   💡 Это интересно: модель научилась угадывать карты по поведению!"
+            )
+            print(f"   🎯 Возможные причины:")
+            print(f"      - Игроки слишком предсказуемы в своих действиях")
+            print(f"      - Сильные корреляции между ситуацией и силой руки")
+            print(f"      - Недостаточно разнообразия в данных")
+        else:
+            print(f"⚠️  Модель без карт работает лучше (+{abs(strength_diff):.1%})")
+            print(f"   🤔 Это странно и требует дополнительного анализа")
+
+        # Анализ по количеству последовательностей
+        with_cards_seqs = results["with_cards"]["total_sequences"]
+        without_cards_seqs = results["without_cards"]["total_sequences"]
+
+        print(f"\n📈 Статистика обучения:")
+        print(f"   🎯 С картами: {with_cards_seqs} последовательностей")
+        print(f"   🎲 Без карт: {without_cards_seqs} последовательностей")
+
+        # Сохранение отчета
+        comparison_report = {
+            "timestamp": datetime.now().isoformat(),
+            "data_file": data_path,
+            "total_records": total_rows,
+            "showdown_records": showdown_count,
+            "sequence_params": {
+                "max_sequence_length": max_sequence_length,
+            },
+            "training_params": training_params,
+            "models": {
+                "with_cards": {
+                    "strength_accuracy": float(with_cards_acc),
+                    "category_accuracy": float(with_cards_cat_acc),
+                    "specific_mse": float(with_cards_mse),
+                    "total_sequences": int(with_cards_seqs),
+                },
+                "without_cards": {
+                    "strength_accuracy": float(without_cards_acc),
+                    "category_accuracy": float(without_cards_cat_acc),
+                    "specific_mse": float(without_cards_mse),
+                    "total_sequences": int(without_cards_seqs),
+                },
+            },
+            "differences": {
+                "strength_accuracy_diff": float(strength_diff),
+                "category_accuracy_diff": float(
+                    with_cards_cat_acc - without_cards_cat_acc
+                ),
+                "specific_mse_diff": float(with_cards_mse - without_cards_mse),
+            },
+            "plots": all_plots,
+        }
+
+        report_path = f"results/sequence_comparison_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(comparison_report, f, indent=2, ensure_ascii=False)
+
+        print(f"📋 Детальный отчет сохранен: {report_path}")
+
+    elif "with_cards" in results:
+        print(f"✅ Успешно обучена только модель С картами")
+        print(
+            f"   🎯 Точность силы руки: {results['with_cards']['strength_accuracy']:.3f}"
+        )
+    elif "without_cards" in results:
+        print(f"✅ Успешно обучена только модель БЕЗ карт")
+        print(
+            f"   🎲 Точность силы руки: {results['without_cards']['strength_accuracy']:.3f}"
+        )
+    else:
+        print(f"❌ Не удалось обучить ни одну модель")
+        return
+
+    # ======================================================================
+    # 4. ЗАКЛЮЧЕНИЕ
+    # ======================================================================
+    print(f"\n🎉 === ОБУЧЕНИЕ ЗАВЕРШЕНО ===")
+    print(f"📁 Результаты сохранены в папках:")
+    print(f"   🤖 models/     - обученные RWKV модели")
+    print(f"   📊 plots/      - графики обучения и анализа")
+    print(f"   📋 results/    - отчеты и конфигурации")
+    print(f"   🃏 results/poker_categories.json - справочник категорий рук")
+
+    print(f"\n💡 Рекомендации:")
+    print(f"   📚 Изучите графики обучения на предмет переобучения")
+    print(f"   🔍 Проанализируйте примеры предсказаний для понимания логики модели")
+    print(f"   📊 Сравните результаты с базовыми методами (логистическая регрессия)")
+    print(f"   🎯 Попробуйте разные длины последовательностей для оптимизации")
+
+    return results
+
+
+def save_sequence_model(model, data_dict, performance, include_hole_cards):
+    """
+    Сохранение обученной последовательной модели с полной информацией
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_type = (
+        "sequence_with_cards" if include_hole_cards else "sequence_without_cards"
+    )
+
+    model_name = f"hand_range_{model_type}"
+    model_file = f"{model_name}_{timestamp}.pth"
+
+    os.makedirs("models", exist_ok=True)
+    model_path = os.path.join("models", model_file)
+
+    # Сохраняем модель со всей необходимой информацией
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "model_class": "SequenceHandRangeRWKV",
+            "scaler": data_dict["scaler"],
+            "encoders": data_dict.get("encoders", {}),
+            "feature_columns": data_dict["feature_columns"],
+            "input_dim": data_dict["input_dim"],
+            "max_sequence_length": data_dict["max_sequence_length"],
+            "include_hole_cards": include_hole_cards,
+            "performance": performance,
+            "timestamp": timestamp,
+            "categories": PokerHandAnalyzer.get_all_categories(),
+            "category_mapping": PokerHandAnalyzer.get_category_mapping(),
+            "rank_names": PokerHandAnalyzer.get_rank_names(),
+            "model_type": "sequence_based",
+            "framework": "pytorch_rwkv",
+        },
+        model_path,
+    )
+
+    # Создаем ссылку на лучшую модель
+    best_model_path = os.path.join("models", f"{model_name}_best.pth")
+    if os.path.exists(best_model_path):
+        os.remove(best_model_path)
+
+    import shutil
+
+    shutil.copy2(model_path, best_model_path)
+
+    print(f"💾 Модель сохранена:")
+    print(f"   📁 {model_path}")
+    print(f"   🔗 {best_model_path} (лучшая)")
+
+    return model_path, best_model_path
+
+
+def process_all_files_with_sequences():
+    """
+    Массовая обработка всех файлов с последовательностями
+    """
+    print(f"\n🚀 === МАССОВАЯ ОБРАБОТКА С ПОСЛЕДОВАТЕЛЬНОСТЯМИ ===")
+
+    # Объединяем все файлы
+    result = combine_all_data_files()
+    if result is None:
+        print("❌ Не удалось объединить файлы")
+        return
+
+    combined_filename, combination_summary = result
+
+    print(f"\n🎯 === ОБУЧЕНИЕ ПОСЛЕДОВАТЕЛЬНЫХ МОДЕЛЕЙ НА ОБЪЕДИНЕННЫХ ДАННЫХ ===")
+    print(f"📁 Файл: {combined_filename}")
+    print(f"📊 Шоудаунов: {combination_summary['total_showdowns']:,}")
+
+    if combination_summary["total_showdowns"] < 100:
+        print("⚠️  Мало данных для последовательных моделей!")
+        return
+
+    results = {}
+    all_plots = []
+
+    max_sequence_length = 20  # Больше для объединенных данных
+    training_params = {
+        "hidden_dim": 256,  # Больше нейронов
+        "num_layers": 4,  # Больше слоев
+        "epochs": 30,  # Больше эпох
+        "lr": 0.0008,  # Чуть меньше lr
+    }
+
+    print(f"🎯 Параметры для большого датасета:")
+    for key, value in training_params.items():
+        print(f"   {key}: {value}")
+    print(f"   max_sequence_length: {max_sequence_length}")
+
+    # Обучаем обе модели
+    for model_type, include_cards in [("БЕЗ карт", False), ("С картами", True)]:
+        print(f"\n{'='*80}")
+        print(
+            f"🎲 Обучение последовательной модели {model_type} на объединенных данных"
+        )
+        print(f"{'='*80}")
+
+        try:
+            data_dict = prepare_sequence_hand_range_data(
+                combined_filename,
+                include_hole_cards=include_cards,
+                max_sequence_length=max_sequence_length,
+            )
+
+            if data_dict is not None:
+                model, history = train_sequence_hand_range_model(
+                    data_dict, **training_params
+                )
+
+                performance = evaluate_sequence_model_performance(
+                    model, data_dict, include_hole_cards=include_cards
+                )
+
+                fig, plot_path = visualize_sequence_results(
+                    model, data_dict, history, include_cards
+                )
+                all_plots.append(plot_path)
+                plt.show()
+
+                predict_sequence_hand_ranges(model, data_dict, sample_hands=5)
+
+                model_path, best_path = save_sequence_model(
+                    model, data_dict, performance, include_cards
+                )
+
+                model_key = "with_cards" if include_cards else "without_cards"
+
+                # Конвертируем numpy типы в обычные Python типы для JSON
+                results[model_key] = {
+                    "strength_accuracy": float(performance["strength_accuracy"]),
+                    "category_accuracy": float(performance["category_accuracy"]),
+                    "specific_mse": float(performance["specific_mse"]),
+                    "total_sequences": int(performance["total_sequences"]),
+                }
+
+                print(f"✅ Последовательная модель {model_type} обучена!")
+
+            else:
+                print(f"❌ Ошибка подготовки данных для модели {model_type}")
+
+        except Exception as e:
+            print(f"❌ Ошибка обучения модели {model_type}: {e}")
+            import traceback
+
+            traceback.print_exc()
+            continue
+
+    # Финальное сравнение
+    if "with_cards" in results and "without_cards" in results:
+        print(f"\n🏆 === ФИНАЛЬНОЕ СРАВНЕНИЕ ПОСЛЕДОВАТЕЛЬНЫХ МОДЕЛЕЙ ===")
+
+        with_cards_acc = results["with_cards"]["strength_accuracy"]
+        without_cards_acc = results["without_cards"]["strength_accuracy"]
+
+        print(f"🎯 С картами: {with_cards_acc:.3f}")
+        print(f"🎲 Без карт: {without_cards_acc:.3f}")
+        print(f"📈 Разница: {with_cards_acc - without_cards_acc:.3f}")
+
+        # Создаем финальный отчет с правильными типами данных
+        final_report = {
+            "timestamp": datetime.now().isoformat(),
+            "model_type": "sequence_based_rwkv",
+            "combined_data_summary": {
+                "total_files": int(combination_summary["total_files"]),
+                "total_records": int(combination_summary["total_records"]),
+                "total_showdowns": int(combination_summary["total_showdowns"]),
+                "combined_file": str(combination_summary["combined_file"]),
+            },
+            "sequence_params": {"max_length": int(max_sequence_length)},
+            "training_params": {
+                k: float(v) if isinstance(v, (int, float)) else str(v)
+                for k, v in training_params.items()
+            },
+            "results": results,
+            "plots": [str(p) for p in all_plots],
+        }
+
+        report_path = f"results/sequence_combined_training_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(final_report, f, indent=2, ensure_ascii=False)
+
+        print(f"📋 Финальный отчет: {report_path}")
+
+    print(f"\n🎉 Массовое обучение последовательных моделей завершено!")
+
+
+# Обновляем главную функцию
 if __name__ == "__main__":
-    main()
+    # Запускаем новую версию с последовательностями
+    main_with_sequences()
