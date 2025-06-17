@@ -19,6 +19,10 @@ import pickle
 import json
 import glob
 from datetime import datetime
+from collections import defaultdict
+import itertools
+from collections import Counter
+
 
 
 def safe_json_serialize(obj):
@@ -41,8 +45,6 @@ def safe_json_serialize(obj):
         return obj
 
 
-import itertools
-from collections import Counter
 
 
 class PokerHandEvaluator:
@@ -4227,10 +4229,767 @@ def create_adaptive_sequences(df, sequence_params, balance_strategy="adaptive"):
     return sequences, sequence_info, sequence_params
 
 
+#############################################################################################################################
+### NEW CODE ###
+############################################################################################################################
+
+
+# ===================== НОВЫЙ ПОДХОД К ДАННЫМ =====================
+
+
+
+
+
+def prepare_hand_based_sequences(file_path, include_hole_cards=True, use_hm3=True):
+    """
+    Подготовка данных с разделением по рукам (новый подход)
+    """
+    print(f"🎯 === ПОДГОТОВКА ДАННЫХ (РАЗДЕЛЕНИЕ ПО РУКАМ) ===")
+    
+    # Загрузка данных
+    df = pd.read_csv(file_path) if isinstance(file_path, str) else file_path
+    print(f"📊 Загружено {len(df)} записей")
+    
+    # Фильтрация записей с шоудауном
+    mask = (df['Showdown_1'].notna()) & (df['Showdown_2'].notna())
+    df_filtered = df[mask].copy().reset_index(drop=True)
+    
+    print(f"🃏 Найдено {len(df_filtered)} записей с открытыми картами")
+    
+    # Добавляем HM3 классификацию
+    if use_hm3:
+        print("🔍 Анализ рук по системе HM3...")
+        df_filtered = add_hand_evaluation_to_dataframe(df_filtered)
+    
+    # Добавляем контекст игроков
+    df_filtered = add_player_context(df_filtered)
+    
+    # Добавляем контекст турнира
+    df_filtered = add_tournament_context(df_filtered)
+    
+    # Разделение по рукам, а не по игрокам!
+    train_df, val_df, test_df = split_by_hands(df_filtered)
+    
+    return create_hand_sequences_dataset(train_df, val_df, test_df, include_hole_cards)
+
+
+def split_by_hands(df, test_size=0.15, val_size=0.15, random_state=42):
+    """
+    Разделение данных по уникальным рукам
+    """
+    print(f"\n🎲 === РАЗДЕЛЕНИЕ ПО РУКАМ ===")
+    
+    # Получаем уникальные руки
+    unique_hands = df['HandID'].unique() if 'HandID' in df.columns else df['Hand'].unique()
+    n_hands = len(unique_hands)
+    
+    print(f"📊 Статистика:")
+    print(f"   🃏 Уникальных рук: {n_hands:,}")
+    print(f"   📈 Всего записей: {len(df):,}")
+    
+    # Анализ распределения
+    hand_counts = df.groupby('HandID' if 'HandID' in df.columns else 'Hand').size()
+    print(f"   📊 Действий на руку: мин={hand_counts.min()}, макс={hand_counts.max()}, среднее={hand_counts.mean():.1f}")
+    
+    # Перемешиваем руки
+    np.random.seed(random_state)
+    shuffled_hands = np.random.permutation(unique_hands)
+    
+    # Разделяем
+    n_test = int(n_hands * test_size)
+    n_val = int(n_hands * val_size)
+    
+    test_hands = shuffled_hands[:n_test]
+    val_hands = shuffled_hands[n_test:n_test + n_val]
+    train_hands = shuffled_hands[n_test + n_val:]
+    
+    # Создаем выборки
+    hand_col = 'HandID' if 'HandID' in df.columns else 'Hand'
+    train_df = df[df[hand_col].isin(train_hands)].copy()
+    val_df = df[df[hand_col].isin(val_hands)].copy()
+    test_df = df[df[hand_col].isin(test_hands)].copy()
+    
+    print(f"\n✅ Результаты разделения:")
+    print(f"   🎓 Train: {len(train_hands):,} рук ({len(train_df):,} записей)")
+    print(f"   🔍 Val: {len(val_hands):,} рук ({len(val_df):,} записей)")
+    print(f"   🧪 Test: {len(test_hands):,} рук ({len(test_df):,} записей)")
+    
+    # Проверка пересечений игроков (это нормально!)
+    players_train = set(train_df['PlayerID'].unique() if 'PlayerID' in train_df else [])
+    players_test = set(test_df['PlayerID'].unique() if 'PlayerID' in test_df else [])
+    overlap = len(players_train & players_test)
+    
+    print(f"\n🔍 Пересечение игроков train/test: {overlap}")
+    print(f"   ✅ Это нормально! Модель учится на паттернах рук, а не запоминает игроков")
+    
+    return train_df, val_df, test_df
+
+
+def add_player_context(df):
+    """
+    Добавляет исторический контекст игроков как признаки
+    """
+    print(f"👥 Добавление контекста игроков...")
+    
+    # Статистика по игрокам за всю историю
+    player_stats = df.groupby('PlayerID').agg({
+        'Bet': ['mean', 'std', 'count'],
+        'Allin': 'mean',
+        'PlayerWins': 'mean',
+        'WinAmount': 'mean'
+    })
+    
+    player_stats.columns = [
+        'player_avg_bet', 'player_bet_std', 'player_hands_count',
+        'player_allin_rate', 'player_win_rate', 'player_avg_win'
+    ]
+    
+    # Добавляем к основному датафрейму
+    df = df.merge(player_stats, left_on='PlayerID', right_index=True, how='left')
+    
+    # Скользящие статистики последних N рук
+    for window in [5, 10, 20]:
+        df[f'player_win_rate_last{window}'] = (
+            df.groupby('PlayerID')['PlayerWins']
+            .rolling(window, min_periods=1)
+            .mean()
+            .reset_index(0, drop=True)
+        )
+    
+    return df
+
+
+def add_tournament_context(df):
+    """
+    Добавляет контекст турнира/сессии
+    """
+    print(f"🏆 Добавление контекста турнира...")
+    
+    if 'TournamentNumber' in df.columns:
+        # Статистика по турниру
+        tournament_stats = df.groupby('TournamentNumber').agg({
+            'Pot': 'mean',
+            'Stack': 'mean',
+            'Level': 'max'
+        })
+        
+        tournament_stats.columns = ['tournament_avg_pot', 'tournament_avg_stack', 'tournament_max_level']
+        df = df.merge(tournament_stats, left_on='TournamentNumber', right_index=True, how='left')
+    
+    # Позиция в турнире (ранняя/средняя/поздняя стадия)
+    if 'Level' in df.columns:
+        df['tournament_stage'] = pd.cut(df['Level'], bins=3, labels=['early', 'middle', 'late'])
+    
+    return df
+
+def prepare_features(df, include_hole_cards):
+    """Подготовка списка признаков"""
+    feature_columns = [
+        'Level', 'Pot', 'Stack', 'SPR', 'Street_id', 'Round',
+        'ActionOrder', 'Seat', 'Dealer', 'Bet', 'Allin',
+        'PlayerWins', 'WinAmount'
+    ]
+    
+    # Добавляем контекстные признаки игрока
+    player_context_cols = [
+        'player_avg_bet', 'player_bet_std', 'player_hands_count',
+        'player_allin_rate', 'player_win_rate', 'player_avg_win'
+    ]
+    
+    for col in player_context_cols:
+        if col in df.columns:
+            feature_columns.append(col)
+    
+    # Карты стола
+    for i in range(1, 6):
+        if f'Card{i}_rank' in df.columns:
+            feature_columns.extend([f'Card{i}_rank', f'Card{i}_suit'])
+    
+    # Карты игрока (если нужно)
+    if include_hole_cards:
+        if 'hole1_rank' in df.columns:
+            feature_columns.extend(['hole1_rank', 'hole1_suit', 'hole2_rank', 'hole2_suit'])
+    
+    return feature_columns
+
+class HandSequenceDataset(Dataset):
+    """Dataset для последовательностей рук"""
+    def __init__(self, sequences, feature_columns, scaler, max_seq_length=30):
+        self.sequences = sequences
+        self.feature_columns = feature_columns
+        self.scaler = scaler
+        self.max_seq_length = max_seq_length
+        
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        seq_df = self.sequences[idx]
+        
+        # Извлекаем признаки
+        features = seq_df[self.feature_columns].values
+        features_scaled = self.scaler.transform(features)
+        
+        # Padding если нужно
+        seq_len = len(features_scaled)
+        if seq_len < self.max_seq_length:
+            padding = np.zeros((self.max_seq_length - seq_len, features_scaled.shape[1]))
+            features_scaled = np.vstack([features_scaled, padding])
+        
+        # Целевые переменные (берем с последней записи)
+        last_row = seq_df.iloc[-1]
+        targets = {
+            'strength': last_row['hand_strength'],
+            'categories': np.zeros(73)  # one-hot для категории
+        }
+        
+        if 'hand_type_hm3' in last_row:
+            # Найти индекс категории
+            category_idx = 0  # заглушка
+            targets['categories'][category_idx] = 1
+        
+        return {
+            'features': torch.tensor(features_scaled, dtype=torch.float32),
+            'targets': targets,
+            'mask': torch.tensor([False] * seq_len + [True] * (self.max_seq_length - seq_len))
+        }
+
+def hand_sequence_collate_fn(batch):
+    """Функция для батчинга последовательностей"""
+    features = torch.stack([item['features'] for item in batch])
+    masks = torch.stack([item['mask'] for item in batch])
+    
+    targets = {
+        'strength': torch.tensor([item['targets']['strength'] for item in batch], dtype=torch.long),
+        'categories': torch.tensor([item['targets']['categories'] for item in batch], dtype=torch.float32)
+    }
+    
+    return {
+        'features': features,
+        'targets': targets,
+        'mask': masks
+    }
+
+def evaluate_improved_model(model, data_dict):
+    """Оценка улучшенной модели"""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.eval()
+    
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for batch in data_dict['test_loader']:
+            inputs = batch['features'].to(device)
+            targets = batch['targets']['strength'].to(device)
+            mask = batch.get('mask')
+            
+            outputs = model(inputs, mask=mask)
+            _, predicted = torch.max(outputs['hand_strength'], 1)
+            
+            total += targets.size(0)
+            correct += (predicted == targets).sum().item()
+    
+    accuracy = correct / total
+    return {'strength_accuracy': accuracy}
+
+
+
+def create_hand_sequences_dataset(train_df, val_df, test_df, include_hole_cards):
+    """
+    Создает последовательности внутри каждой руки
+    """
+    print(f"\n🔄 === СОЗДАНИЕ ПОСЛЕДОВАТЕЛЬНОСТЕЙ ВНУТРИ РУК ===")
+    
+    def create_sequences_for_hand(hand_data):
+        """Создает все возможные префиксы действий в руке"""
+        sequences = []
+        
+        # Сортируем по порядку действий
+        hand_data = hand_data.sort_values(['Street_id', 'ActionOrder'])
+        
+        # Создаем последовательности разной длины
+        for end_idx in range(1, len(hand_data) + 1):
+            seq = hand_data.iloc[:end_idx].copy()
+            
+            # Добавляем позиционную информацию
+            seq['sequence_length'] = end_idx
+            seq['actions_remaining'] = len(hand_data) - end_idx
+            seq['sequence_progress'] = end_idx / len(hand_data)
+            
+            sequences.append(seq)
+        
+        return sequences
+    
+    # Обрабатываем каждую выборку
+    all_sequences = {'train': [], 'val': [], 'test': []}
+    
+    for split_name, split_df in [('train', train_df), ('val', val_df), ('test', test_df)]:
+        hand_col = 'HandID' if 'HandID' in split_df.columns else 'Hand'
+        
+        for hand_id in split_df[hand_col].unique():
+            hand_data = split_df[split_df[hand_col] == hand_id]
+            
+            # Создаем последовательности для этой руки
+            hand_sequences = create_sequences_for_hand(hand_data)
+            all_sequences[split_name].extend(hand_sequences)
+        
+        print(f"   {split_name}: {len(all_sequences[split_name])} последовательностей")
+    
+    # Подготовка признаков и создание датасетов
+    feature_columns = prepare_features(train_df, include_hole_cards)
+    
+    # Нормализация
+    scaler = StandardScaler()
+    scaler.fit(pd.concat([seq[feature_columns] for seq in all_sequences['train']]))
+    
+    # Создание DataLoader'ов
+    datasets = {}
+    loaders = {}
+    
+    for split in ['train', 'val', 'test']:
+        datasets[split] = HandSequenceDataset(
+            all_sequences[split], 
+            feature_columns, 
+            scaler,
+            max_seq_length=30
+        )
+        
+        batch_size = 32 if split == 'train' else 64
+        shuffle = split == 'train'
+        
+        loaders[split] = DataLoader(
+            datasets[split], 
+            batch_size=batch_size, 
+            shuffle=shuffle,
+            collate_fn=hand_sequence_collate_fn
+        )
+    
+    return {
+        'train_loader': loaders['train'],
+        'val_loader': loaders['val'],
+        'test_loader': loaders['test'],
+        'scaler': scaler,
+        'feature_columns': feature_columns,
+        'input_dim': len(feature_columns),
+        'num_categories': 73 if 'hand_type_hm3' in train_df.columns else 9
+    }
+
+
+# ===================== УЛУЧШЕННАЯ МОДЕЛЬ =====================
+
+class ImprovedHandRWKV(nn.Module):
+    """
+    Улучшенная RWKV модель с правильной рецептивностью
+    """
+    def __init__(self, input_dim, hidden_dim=256, num_layers=4, num_heads=8):
+        super().__init__()
+        
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        
+        # Эмбеддинги для категориальных признаков
+        self.action_embedding = nn.Embedding(10, 32)
+        self.position_embedding = nn.Embedding(10, 16)
+        self.street_embedding = nn.Embedding(5, 16)
+        
+        # Проекция входа
+        self.input_projection = nn.Linear(input_dim + 64, hidden_dim)
+        
+        # Улучшенные RWKV блоки
+        self.rwkv_blocks = nn.ModuleList([
+            ImprovedRWKVBlock(hidden_dim) for _ in range(num_layers)
+        ])
+        
+        # Multi-head attention для ключевых моментов
+        self.attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+        
+        # Нормализация
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(0.1)
+        
+        # Выходные головы
+        self.strength_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, 5)  # 5 классов силы
+        )
+        
+        self.category_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 73)  # 73 HM3 категории
+        )
+        
+    def forward(self, x, actions=None, positions=None, streets=None, mask=None):
+        batch_size, seq_len, _ = x.shape
+        
+        # Комбинируем входные данные
+        if actions is not None:
+            action_emb = self.action_embedding(actions)
+            x = torch.cat([x, action_emb], dim=-1)
+        
+        if positions is not None:
+            position_emb = self.position_embedding(positions)
+            x = torch.cat([x, position_emb], dim=-1)
+            
+        if streets is not None:
+            street_emb = self.street_embedding(streets)
+            x = torch.cat([x, street_emb], dim=-1)
+        
+        # Проекция
+        x = self.input_projection(x)
+        
+        # Проход через RWKV блоки
+        for block in self.rwkv_blocks:
+            x = block(x, mask=mask)
+            x = self.layer_norm(x)
+            x = self.dropout(x)
+        
+        # Attention для выделения важных моментов
+        x, _ = self.attention(x, x, x, key_padding_mask=mask)
+        
+        # Берем последний валидный токен для каждой последовательности
+        if mask is not None:
+            # Находим последний не-masked элемент
+            lengths = (~mask).sum(dim=1)
+            batch_indices = torch.arange(batch_size).to(x.device)
+            last_tokens = x[batch_indices, lengths - 1]
+        else:
+            last_tokens = x[:, -1, :]
+        
+        # Предсказания
+        strength_logits = self.strength_head(last_tokens)
+        category_logits = self.category_head(last_tokens)
+        
+        return {
+            'hand_strength': strength_logits,
+            'category_probs': category_logits
+        }
+
+
+class ImprovedRWKVBlock(nn.Module):
+    """
+    Улучшенный RWKV блок с правильной реализацией
+    """
+    def __init__(self, hidden_dim):
+        super().__init__()
+        
+        self.hidden_dim = hidden_dim
+        
+        # Time mixing параметры
+        self.time_mix_k = nn.Parameter(torch.zeros(hidden_dim))
+        self.time_mix_v = nn.Parameter(torch.zeros(hidden_dim))
+        self.time_mix_r = nn.Parameter(torch.zeros(hidden_dim))
+        
+        # Time decay и bonus
+        self.time_decay = nn.Parameter(torch.zeros(hidden_dim))
+        self.time_first = nn.Parameter(torch.zeros(hidden_dim))
+        
+        # Линейные слои
+        self.key = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.value = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.receptance = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.output = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        
+        # Инициализация
+        self._init_weights()
+        
+    def _init_weights(self):
+        # Специальная инициализация для покера
+        nn.init.normal_(self.time_decay, -5, 1)  # Начальный decay
+        nn.init.normal_(self.time_first, 0, 0.1)  # Небольшой bonus
+        nn.init.uniform_(self.time_mix_k, 0.4, 0.6)
+        nn.init.uniform_(self.time_mix_v, 0.4, 0.6) 
+        nn.init.uniform_(self.time_mix_r, 0.4, 0.6)
+        
+    def forward(self, x, mask=None):
+        batch_size, seq_len, _ = x.shape
+        
+        outputs = []
+        state = torch.zeros(batch_size, self.hidden_dim).to(x.device)
+        
+        for t in range(seq_len):
+            xt = x[:, t]
+            
+            if t == 0:
+                prev_x = torch.zeros_like(xt)
+            else:
+                prev_x = x[:, t-1]
+            
+            # Time mixing
+            k = self.key(xt * self.time_mix_k + prev_x * (1 - self.time_mix_k))
+            v = self.value(xt * self.time_mix_v + prev_x * (1 - self.time_mix_v))
+            r = torch.sigmoid(self.receptance(xt * self.time_mix_r + prev_x * (1 - self.time_mix_r)))
+            
+            # WKV computation
+            if t == 0:
+                wkv = (self.time_first + k) * v
+            else:
+                # Обновляем состояние
+                state = state * torch.exp(-torch.exp(self.time_decay)) + k * v
+                wkv = state
+            
+            # Применяем рецептивность
+            out = r * self.output(wkv)
+            outputs.append(out)
+            
+        return torch.stack(outputs, dim=1)
+
+
+# ===================== ФУНКЦИЯ ОБУЧЕНИЯ =====================
+
+def train_improved_model(data_dict, model_params=None, training_params=None):
+    """
+    Обучение улучшенной модели
+    """
+    if model_params is None:
+        model_params = {
+            'hidden_dim': 256,
+            'num_layers': 4,
+            'num_heads': 8
+        }
+    
+    if training_params is None:
+        training_params = {
+            'epochs': 30,
+            'lr': 0.001,
+            'patience': 5
+        }
+    
+    print(f"\n🚀 === ОБУЧЕНИЕ УЛУЧШЕННОЙ МОДЕЛИ ===")
+    print(f"📊 Параметры модели: {model_params}")
+    print(f"🎯 Параметры обучения: {training_params}")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Создаем модель
+    model = ImprovedHandRWKV(
+        input_dim=data_dict['input_dim'],
+        **model_params
+    ).to(device)
+    
+    # Оптимизатор и планировщик
+    optimizer = optim.AdamW(model.parameters(), lr=training_params['lr'], weight_decay=0.01)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+    
+    # Функции потерь
+    strength_criterion = nn.CrossEntropyLoss()
+    category_criterion = nn.BCEWithLogitsLoss()
+    
+    # История обучения
+    history = defaultdict(list)
+    best_val_loss = float('inf')
+    patience_counter = 0
+    
+    for epoch in range(training_params['epochs']):
+        # Training
+        model.train()
+        train_losses = []
+        
+        for batch in data_dict['train_loader']:
+            inputs = batch['features'].to(device)
+            targets = {k: v.to(device) for k, v in batch['targets'].items()}
+            
+            optimizer.zero_grad()
+            
+            outputs = model(
+                inputs,
+                actions=batch.get('actions'),
+                positions=batch.get('positions'),
+                streets=batch.get('streets'),
+                mask=batch.get('mask')
+            )
+            
+            # Потери
+            strength_loss = strength_criterion(outputs['hand_strength'], targets['strength'])
+            category_loss = category_criterion(outputs['category_probs'], targets['categories'])
+            
+            total_loss = strength_loss + 0.5 * category_loss
+            
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            train_losses.append(total_loss.item())
+        
+        # Validation
+        model.eval()
+        val_losses = []
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for batch in data_dict['val_loader']:
+                inputs = batch['features'].to(device)
+                targets = {k: v.to(device) for k, v in batch['targets'].items()}
+                
+                outputs = model(
+                    inputs,
+                    actions=batch.get('actions'),
+                    positions=batch.get('positions'),
+                    streets=batch.get('streets'),
+                    mask=batch.get('mask')
+                )
+                
+                strength_loss = strength_criterion(outputs['hand_strength'], targets['strength'])
+                category_loss = category_criterion(outputs['category_probs'], targets['categories'])
+                total_loss = strength_loss + 0.5 * category_loss
+                
+                val_losses.append(total_loss.item())
+                
+                # Точность
+                _, predicted = torch.max(outputs['hand_strength'], 1)
+                val_total += targets['strength'].size(0)
+                val_correct += (predicted == targets['strength']).sum().item()
+        
+        # Метрики эпохи
+        avg_train_loss = np.mean(train_losses)
+        avg_val_loss = np.mean(val_losses)
+        val_accuracy = val_correct / val_total
+        
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
+        history['val_accuracy'].append(val_accuracy)
+        
+        print(f"Epoch {epoch+1}/{training_params['epochs']}:")
+        print(f"  Train Loss: {avg_train_loss:.4f}")
+        print(f"  Val Loss: {avg_val_loss:.4f}")
+        print(f"  Val Accuracy: {val_accuracy:.3f}")
+        
+        # Early stopping
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # Сохраняем лучшую модель
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= training_params['patience']:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+            
+        scheduler.step(avg_val_loss)
+    
+    # Загружаем лучшую модель
+    model.load_state_dict(best_model_state)
+    
+    return model, history
+
+
+# ===================== ГЛАВНАЯ ФУНКЦИЯ ДЛЯ ПАРАЛЛЕЛЬНОГО ОБУЧЕНИЯ =====================
+
+def run_parallel_training(data_path):
+    """
+    Запускает параллельное обучение: старый подход vs новый подход
+    """
+    print(f"\n🏁 === ПАРАЛЛЕЛЬНОЕ СРАВНЕНИЕ ПОДХОДОВ ===")
+    print(f"📊 Данные: {data_path}")
+    
+    results = {}
+    
+    # 1. Старый подход (разделение по игрокам)
+    print(f"\n" + "="*80)
+    print(f"📌 1. СТАРЫЙ ПОДХОД (разделение по игрокам)")
+    print(f"="*80)
+    
+    try:
+        old_data = prepare_sequence_hand_range_data_with_hm3(
+            data_path,
+            include_hole_cards=False,
+            max_sequence_length=20
+        )
+        
+        old_model, old_history = train_sequence_hand_range_model(
+            old_data,
+            hidden_dim=128,
+            num_layers=3,
+            epochs=25
+        )
+        
+        old_performance = evaluate_sequence_model_performance(old_model, old_data)
+        results['old_approach'] = {
+            'accuracy': old_performance['strength_accuracy'],
+            'history': old_history
+        }
+        
+        print(f"✅ Старый подход: точность = {old_performance['strength_accuracy']:.3f}")
+        
+    except Exception as e:
+        print(f"❌ Ошибка в старом подходе: {e}")
+        
+    # 2. Новый подход (разделение по рукам)
+    print(f"\n" + "="*80)
+    print(f"🎯 2. НОВЫЙ ПОДХОД (разделение по рукам)")
+    print(f"="*80)
+    
+    try:
+        new_data = prepare_hand_based_sequences(
+            data_path,
+            include_hole_cards=False,
+            use_hm3=True
+        )
+        
+        new_model, new_history = train_improved_model(new_data)
+        
+        # Оценка
+        new_performance = evaluate_improved_model(new_model, new_data)
+        results['new_approach'] = {
+            'accuracy': new_performance['strength_accuracy'],
+            'history': new_history
+        }
+        
+        print(f"✅ Новый подход: точность = {new_performance['strength_accuracy']:.3f}")
+        
+    except Exception as e:
+        print(f"❌ Ошибка в новом подходе: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # 3. Сравнение результатов
+    if len(results) == 2:
+        print(f"\n" + "="*80)
+        print(f"🏆 === СРАВНЕНИЕ РЕЗУЛЬТАТОВ ===")
+        print(f"="*80)
+        
+        old_acc = results['old_approach']['accuracy']
+        new_acc = results['new_approach']['accuracy']
+        improvement = new_acc - old_acc
+        
+        print(f"📊 Старый подход (по игрокам): {old_acc:.3f}")
+        print(f"🎯 Новый подход (по рукам): {new_acc:.3f}")
+        print(f"📈 Улучшение: {improvement:+.3f} ({improvement/old_acc*100:+.1f}%)")
+        
+        if improvement > 0:
+            print(f"\n✅ Новый подход показывает лучшие результаты!")
+            print(f"💡 Это подтверждает, что разделение по рукам более корректно")
+        else:
+            print(f"\n🤔 Старый подход работает лучше или одинаково")
+            print(f"💡 Возможные причины:")
+            print(f"   - Недостаточно данных")
+            print(f"   - Нужна настройка гиперпараметров")
+            print(f"   - Специфика данных")
+    
+    return results
+
+
 # -----------------------------------------------------------------
 
 
+
+
+
 # ---------------------- 7. Главная функция ----------------------
+
+
+    
+    
+    
+    
+
 def main():
     """Главная функция для обучения и оценки моделей"""
 
@@ -5160,7 +5919,66 @@ def process_all_files_with_sequences():
     print(f"\n🎉 Массовое обучение последовательных моделей завершено!")
 
 
+def main_parallel():
+    """
+    Главная функция для параллельного сравнения подходов
+    """
+    print("🎰 === ПАРАЛЛЕЛЬНОЕ СРАВНЕНИЕ ПОДХОДОВ К ОБУЧЕНИЮ ===")
+    
+    # Создаем папки
+    setup_directories()
+    
+    # Выбираем данные
+    data_choice = choose_data_file_with_percentage()
+    if not data_choice:
+        return
+    
+    # Обрабатываем выбор
+    if isinstance(data_choice, tuple) and data_choice[0] == "COMBINE_PERCENT":
+        data_path, _ = combine_percentage_of_files(data_choice[1])
+    else:
+        data_path = data_choice
+    
+    # Запускаем параллельное обучение
+    results = run_parallel_training(data_path)
+    
+    # Сохраняем результаты
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    report_path = f"results/parallel_comparison_{timestamp}.json"
+    
+    with open(report_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"\n📋 Отчет сохранен: {report_path}")
+    print(f"🎉 Параллельное сравнение завершено!")
+
+
+if __name__ == "__main__":
+    main_parallel()
+    
+
 # Обновляем главную функцию
 if __name__ == "__main__":
-    # Запускаем новую версию с последовательностями
-    main_with_sequences()
+    # Выбор режима запуска
+    print("Выберите режим:")
+    print("1. Старый подход (разделение по игрокам)")
+    print("2. Новый подход (разделение по рукам)")
+    print("3. Параллельное сравнение обоих подходов")
+    
+    choice = input("Ваш выбор (1/2/3): ").strip()
+    
+    if choice == "1":
+        main_with_sequences()  # Старый код
+    elif choice == "2":
+        # Только новый подход
+        setup_directories()
+        data_choice = choose_data_file_with_percentage()
+        if data_choice:
+            if isinstance(data_choice, tuple):
+                data_path, _ = combine_percentage_of_files(data_choice[1])
+            else:
+                data_path = data_choice
+            new_data = prepare_hand_based_sequences(data_path, include_hole_cards=False)
+            model, history = train_improved_model(new_data)
+    else:
+        main_parallel()  # Параллельное сравнение
